@@ -1,0 +1,11 @@
+# SwiftPM build products — 650M between the two packages, all reproducible.
+.build/
+Spike/.build/
+
+# Assembled by make-app.sh from the SwiftPM binary; never edited by hand.
+PlugInput.app/
+
+.DS_Store
+
+# Personal, machine-local Claude Code settings.
+.claude/settings.local.json
