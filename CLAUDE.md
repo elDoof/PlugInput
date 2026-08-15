@@ -4,30 +4,48 @@ A macOS menu bar app that puts audio plugins on your live microphone, so you can
 compressor (or anything else) on your voice without opening a DAW — and have Zoom / Discord /
 OBS see the processed signal as a microphone.
 
-## Status: the whole chain works, end to end
+## Status: working and in daily use
 
-Verified on 2026-08-14: **mic → Apple AUDynamicsProcessor → private aggregate → BlackHole**,
-measured from a separate process at **−39.9 dBFS broadband** against a −120.0 dBFS silence
-control, and again at −41.5 dBFS after the engine moved off the main actor. That was the last
-unverified seam. Also verified: 43/43 tests, `PlugInput.app`
-launches and stays resident, 677 AU effects discovered, no orphaned aggregates, and session
-persistence against a real Audio Unit (restores the plugin, resumes the engine, and autosaves
-the plugin's live `fullState`).
+Last verified 2026-08-15: **mic → AnalogObsession LALA → private aggregate → BlackHole**,
+measured from a separate process at **−34.0 dBFS broadband** against a −120.0 dBFS silence
+control. Also verified: 43/43 tests, `PlugInput.app` launches and stays resident, 677 AU
+effects discovered, no orphaned aggregates, plugin switching survives an engine restart, the
+monitor toggle mutes only the monitor leg, and session persistence against a real Audio Unit.
 
 Reproduce it with the app running and a plugin loaded:
 
 ```bash
-cd Spike && ./.build/debug/PlugInputSpike listen 3
+cd Spike && ./.build/debug/PlugInputSpike listen 4 BlackHole
 ```
 
-Broadband well above −120.0 dBFS is the proof. Ignore the harness's `RESULT: FAIL` — it looks
-for the Phase 0 440Hz tone, which a microphone does not emit; read the broadband number.
+Broadband well above −120.0 dBFS is the proof. Two traps in reading that number: ignore the
+harness's `RESULT: FAIL`, which looks for the Phase 0 440Hz tone that a microphone does not
+emit; and **give the engine a few seconds after launch** — listening too early reads −120.0 and
+looks exactly like a real failure.
 
-**Plugin switching is confirmed working.** The button rewrite (gotcha #16) did take clicks: the
-log shows `effect selected: LALA` at 10:22:20 on 2026-08-14, followed by a full engine restart,
-and `session.json` persisted the new plugin. What made it *look* broken was that the restart
-then aborted the process on a leaked input tap (gotcha #14) — the click landed, the app died a
-quarter-second later. Both halves are fixed; the crash is the one worth remembering.
+### Version control
+
+The project is a git repo, pushed to **`github.com/elDoof/PlugInput` (private)**, single branch
+`main`. `.gitignore` keeps `.build/` (~650M), `PlugInput.app/`, and `.claude/settings.local.json`
+out. `README.md` is the human-facing doc — what the app is, how to run it, known limitations.
+**This file is the engineering companion to it**; keep the overlap thin and let README describe
+*use* while this describes *why*.
+
+### What the last session changed
+
+Four user-visible fixes, all verified rather than assumed:
+
+- **Crash on plugin switch** — a leaked input tap (gotcha #14).
+- **Silent microphone** — two independent causes: the input resolver could pick BlackHole
+  (gotcha #15), and ad-hoc signing dropped the TCC grant every rebuild (gotcha #13).
+- **Intermittent UI freeze** — `OSLogStore` and CoreAudio queries on the main actor
+  (gotcha #18).
+- **Monitor on/off checkbox** — mutes the monitor leg of the output channel map without
+  touching what other apps receive.
+
+And one deliberate non-delivery: naming the virtual mic "PlugInput" (gotchas #17, #19). Both
+aggregate routes were built, measured, and reverted. Do not start a third attempt without
+reading those two entries — the remaining route is a real HAL driver.
 
 ## Build and run
 
@@ -281,9 +299,28 @@ whether the engine actually started. Delete it to reset the app.
 - **Remaining UI polish:** monitor/output device pickers, and a latency badge. The searchable
   browser, dB meter, signal chain, monitor toggle, and activity log are done.
 
-Task #6 (presets, persistence, login item) is built — see "Persistence" above. When #5 lands,
-`SessionSnapshot` grows from one `plugin` + `pluginState` to an ordered list of them; the
-invariant that state travels with its own plugin is what makes that a small change.
+Presets, persistence, and the login item are built — see "Persistence" above.
+
+## Working on this
+
+Verify, do not assume. Every layer of this app reports success while producing silence, so
+"it compiles", "the write returned `noErr`", and "the device was created" have each been wrong
+here in a way that cost hours. The check that settles it is the two-process listener in
+`Spike/`, because it stands outside the app entirely.
+
+Three failures from the last session, as calibration:
+
+- A channel-map write returned `noErr` **and read back correctly** and still killed the start
+  (#19).
+- A device was created with the right channel counts and carried exact digital silence (#17).
+- A tap was removed on every path that looked like it mattered, and leaked on the one that
+  did (#14).
+
+The app cannot be clicked from a terminal session, so when a question needs a human — "does
+switching plugins still work?" — ask rather than infer. `session.json` can be edited directly
+to drive a restart-and-observe loop without clicking, which is how the monitor toggle was
+verified in both positions; note that a running app rewrites that file on its 30-second
+autosave, so kill it before editing.
 
 ## Conventions
 
