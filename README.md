@@ -23,7 +23,7 @@ other applications, and it must be installed separately.
 ## Build and run
 
 ```bash
-swift build && swift test     # library + 43 unit tests
+swift build && swift test     # library + 50 unit tests
 ./make-app.sh release         # assembles PlugInput.app
 open PlugInput.app            # a waveform icon appears in the menu bar
 ```
@@ -109,13 +109,14 @@ number.
 Sources/AudioCore/       no UI imports — the testable half
   Devices/     CoreAudioProperties, DeviceEnumerator, AggregateDeviceBuilder,
                InputSelection, DeviceDiscovery, VirtualMicrophone
-  Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel
+  Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel, ObjCExceptionBarrier
   Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch
   Persistence/ SessionSnapshot, SessionStore
   Diagnostics/ EngineLog, EngineLogReader, AudioLevel
+Sources/ObjCExceptionBridge/  @try/@catch around AVAudioEngine's raising graph calls
 Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindowController
   Views/       ConsoleView, PluginBrowserView
-Tests/AudioCoreTests/    43 tests
+Tests/AudioCoreTests/    50 tests
 Spike/                   Phase 0 verification harness — separate package
 ```
 

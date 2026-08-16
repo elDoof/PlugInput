@@ -186,16 +186,23 @@ public final class AudioEngineController: @unchecked Sendable {
         }
     }
 
+    /// Teardown, and it must reach the end whatever happens on the way.
+    ///
+    /// Every node call here is barriered with `ignoringObjCException` rather than
+    /// `withGraphBarrier`: this runs from `willTerminate`, where there is nobody left to report
+    /// an error to, and `aggregate?.destroy()` below is the one step that genuinely cannot be
+    /// skipped — an orphan outlives the process and sits in the user's audio settings
+    /// (gotcha #7). A raise while detaching a node must not cost the destroy.
     private func stopOnQueue() {
         // Unconditionally, and before the engine check. A tap outlives `isRunning`, so removing
         // it only "while running" strands one behind whenever the engine has already stopped
         // itself — and the next start then aborts the process rather than throwing.
         removeInputTap()
         if engine.isRunning {
-            engine.stop()
+            ignoringObjCException("stopping engine") { engine.stop() }
         }
         if let effectNode {
-            engine.detach(effectNode)
+            ignoringObjCException("detaching effect") { engine.detach(effectNode) }
             self.effectNode = nil
         }
         aggregate?.destroy()
@@ -250,7 +257,9 @@ public final class AudioEngineController: @unchecked Sendable {
         let deviceFormat = engine.outputNode.inputFormat(forBus: 0)
         let inputNode = engine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
-        let mixer = engine.mainMixerNode
+        // Barriered like the rest: reaching for the main mixer is not a plain property read,
+        // it lazily attaches a node.
+        let mixer = try withGraphBarrier("resolving main mixer") { engine.mainMixerNode }
 
         EngineLog.logger.info(
             """
@@ -274,20 +283,36 @@ public final class AudioEngineController: @unchecked Sendable {
             )
         }
 
+        // Every mutation below goes through a barrier. `attach`, `connect`, `prepare` and
+        // `installTap` all report misuse by *raising*, and an Objective-C exception unwinds past
+        // this function's `throws` and aborts the process. The labels are what name the failing
+        // step afterwards, since the exception text says what the runtime objected to but never
+        // which call it came from.
         if let effect {
-            engine.attach(effect)
-            effectNode = effect
-            engine.connect(inputNode, to: effect, format: inputFormat)
-            engine.connect(effect, to: mixer, format: inputFormat)
+            try withGraphBarrier("attaching effect") {
+                engine.attach(effect)
+                // Recorded before the connects, so a raise part-way through still leaves
+                // `stopOnQueue` something to detach.
+                effectNode = effect
+                engine.connect(inputNode, to: effect, format: inputFormat)
+                engine.connect(effect, to: mixer, format: inputFormat)
+            }
         } else {
-            engine.connect(inputNode, to: mixer, format: inputFormat)
+            try withGraphBarrier("connecting input to mixer") {
+                engine.connect(inputNode, to: mixer, format: inputFormat)
+            }
         }
 
-        engine.connect(mixer, to: engine.outputNode, format: deviceFormat)
-        installInputTap(on: inputNode, format: inputFormat)
+        try withGraphBarrier("connecting mixer to output") {
+            engine.connect(mixer, to: engine.outputNode, format: deviceFormat)
+        }
+        try installInputTap(on: inputNode, format: inputFormat)
 
-        engine.prepare()
-        try engine.start()
+        try withGraphBarrier("preparing engine") { engine.prepare() }
+        // Barriered as well as `try`-ed. `start()` throws properly for the failures it
+        // anticipates — the `-10875` of gotcha #19 among them — and the barrier passes those
+        // through unchanged; this only adds cover for the ones it raises instead.
+        try withGraphBarrier("starting engine") { try engine.start() }
 
         // Published for the UI's latency badge — read it here, on the queue that owns the node.
         publish(effectLatency: effect?.auAudioUnit.latency ?? 0)
@@ -318,16 +343,20 @@ public final class AudioEngineController: @unchecked Sendable {
     /// Objective-C, which unwinds straight past every Swift `do/catch` in this file and aborts
     /// the process. It killed the app on plugin switches: `selectPlugin` cycles the engine, and
     /// any cycle that began with the engine already self-stopped left the previous tap in place.
-    /// The `removeInputTap()` here is belt-and-braces to `stopOnQueue`'s, because the cost of
-    /// being wrong is a crash rather than a caught error.
-    private func installInputTap(on node: AVAudioNode, format: AVAudioFormat) {
+    /// The `removeInputTap()` here is belt-and-braces to `stopOnQueue`'s, and the barrier is a
+    /// third line of defence behind both. Order matters: keep clearing the bus first. The
+    /// barrier turns this crash into a message, which is strictly better than dying, but a
+    /// start that fails is still a start that fails — it is not a licence to stop preventing it.
+    private func installInputTap(on node: AVAudioNode, format: AVAudioFormat) throws {
         removeInputTap()
-        node.installTap(
-            onBus: 0,
-            bufferSize: 1024,
-            format: format,
-            block: Self.peakTap(writingTo: peakLevel)
-        )
+        try withGraphBarrier("installing input tap") {
+            node.installTap(
+                onBus: 0,
+                bufferSize: 1024,
+                format: format,
+                block: Self.peakTap(writingTo: peakLevel)
+            )
+        }
         isTapInstalled = true
     }
 
@@ -335,7 +364,12 @@ public final class AudioEngineController: @unchecked Sendable {
     /// merely accessing that node makes `AVAudioEngine` configure a capture chain.
     private func removeInputTap() {
         guard isTapInstalled else { return }
-        engine.inputNode.removeTap(onBus: 0)
+        ignoringObjCException("removing input tap") {
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        // Cleared even if removal raised. What the tap's state is at that point is unknowable,
+        // and leaving the flag set would make every later attempt re-run the same failing
+        // removal; `installInputTap` clearing the bus first is the backstop either way.
         isTapInstalled = false
     }
 

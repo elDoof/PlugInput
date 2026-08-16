@@ -12,7 +12,10 @@ let package = Package(
         .library(name: "AudioCore", targets: ["AudioCore"]),
     ],
     targets: [
-        .target(name: "AudioCore"),
+        // Swift cannot @catch, and AVAudioEngine's graph API raises rather than throws. This is
+        // the one Objective-C frame in the project; see PIObjCExceptionBridge.h for why.
+        .target(name: "ObjCExceptionBridge"),
+        .target(name: "AudioCore", dependencies: ["ObjCExceptionBridge"]),
         .executableTarget(name: "PlugInput", dependencies: ["AudioCore"]),
         .testTarget(name: "AudioCoreTests", dependencies: ["AudioCore"]),
     ]

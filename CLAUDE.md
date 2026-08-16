@@ -8,7 +8,7 @@ OBS see the processed signal as a microphone.
 
 Last verified 2026-08-15: **mic → AnalogObsession LALA → private aggregate → BlackHole**,
 measured from a separate process at **−34.0 dBFS broadband** against a −120.0 dBFS silence
-control. Also verified: 43/43 tests, `PlugInput.app` launches and stays resident, 677 AU
+control. Also verified: 50/50 tests, `PlugInput.app` launches and stays resident, 677 AU
 effects discovered, no orphaned aggregates, plugin switching survives an engine restart, the
 monitor toggle mutes only the monitor leg, and session persistence against a real Audio Unit.
 
@@ -50,7 +50,7 @@ reading those two entries — the remaining route is a real HAL driver.
 ## Build and run
 
 ```bash
-swift build && swift test     # library + 43 unit tests
+swift build && swift test     # library + 50 unit tests
 ./make-app.sh release         # assembles PlugInput.app
 open PlugInput.app            # waveform icon appears in the menu bar
 killall PlugInput
@@ -84,14 +84,15 @@ be answered without touching the menu bar. When the app is wedged rather than wr
 Sources/AudioCore/       no UI imports — the testable half
   Devices/     CoreAudioProperties, DeviceEnumerator, AggregateDeviceBuilder, InputSelection,
                DeviceDiscovery, VirtualMicrophone (naming constants — see gotchas #17, #19)
-  Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel
+  Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel, ObjCExceptionBarrier
   Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch
   Persistence/ SessionSnapshot, SessionStore
   Diagnostics/ EngineLog, EngineLogReader, AudioLevel
+Sources/ObjCExceptionBridge/  the only Objective-C in the project — @try/@catch, see gotcha #21
 Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindowController,
                          LoginItem
   Views/       ConsoleView (window: chain, meter, activity), PluginBrowserView (search)
-Tests/AudioCoreTests/    43 tests
+Tests/AudioCoreTests/    50 tests
 Spike/                 Phase 0 verification harness — separate package, kept as reference
 ```
 
@@ -250,6 +251,23 @@ silence rather than an error.
     until it is deleted by hand. `AggregateDevice.init` now destroys any device already holding
     the UID first, which makes launch self-healing; the log line is `reclaimed stale aggregate`.
     This bit hard while the device was briefly public, but it applies to the private one too.
+21. **Graph mutation is now barriered — and a catch is not a recovery.** `installTap`, `attach`,
+    `connect`, `detach`, `prepare` and `mainMixerNode` all signal misuse by *raising* an
+    `NSException`, which unwinds past every Swift `do/catch` and aborts the process; gotcha #14
+    was one instance of the family. `Sources/ObjCExceptionBridge` is a ~25-line Objective-C
+    `@try/@catch` — the only ObjC in the project, because Swift cannot `@catch` — and
+    `withGraphBarrier(_:_:)` turns a raise into an `ObjCExceptionError` naming the step that
+    failed. All 12 call sites in `AudioEngineController` go through it.
+    **The contract is teardown, never resume.** A raise happens part-way through `AVAudioEngine`
+    mutating itself, and nothing promises what it left behind, so every catch site must tear the
+    graph down — which is what `startOnQueue`'s existing `catch` already did, and why this
+    dropped in without new error handling. Teardown itself uses `ignoringObjCException`, because
+    `stopOnQueue` runs from `willTerminate` and `aggregate?.destroy()` must survive a raise above
+    it (gotcha #7). Two honest limits: it catches `NSException`, so a C++ exception from inside
+    CoreAudio would still terminate; and unwinding past Swift frames skips their ARC cleanup, so
+    each catch leaks a little. Both beat dying. Verified against the real thing — a test installs
+    a second tap on an occupied bus and asserts the resulting
+    `required condition is false: nullptr == Tap()` arrives as a catchable Swift error.
 
 ## Persistence
 
@@ -282,11 +300,6 @@ whether the engine actually started. Delete it to reset the app.
   grows from one `plugin` + `pluginState` to an ordered list; the invariant that state travels
   with its own plugin is what keeps that small. Touches `AppModel` and `buildGraph` only — not
   the device or channel-map logic.
-- **An Objective-C exception barrier around graph mutation.** Gotcha #14 was fixed at its
-  source, but `installTap`, `attach`, and `connect` all still *raise* rather than throw, so the
-  next unanticipated misuse is an abort rather than a red status line. A ~20-line ObjC shim
-  target wrapping `buildGraph`'s calls in `@try/@catch` would convert the whole class of them
-  into caught Swift errors. Worth doing before the chain work in #5 multiplies those calls.
 - **Naming the mic "PlugInput" is closed off with aggregates — do not try a third time.**
   Both routes were built and measured, and both failed: a second public aggregate wrapping
   BlackHole delivers silence (gotcha #17), and reordering the engine's own aggregate to lead
