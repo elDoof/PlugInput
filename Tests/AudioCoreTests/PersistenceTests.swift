@@ -35,17 +35,17 @@ struct MonitorToggleTests {
         // Arrange
         let original = SessionSnapshot.empty
             .settingInput("mic-uid")
-            .settingPlugin(compressor)
+            .settingChain(PluginChain.empty.adding(compressor))
             .settingRunning(true)
 
         // Act
         let muted = original.settingMonitorEnabled(false)
 
-        // Assert — immutability, and no collateral damage to the plugin or its state.
+        // Assert — immutability, and no collateral damage to the chain or its settings.
         #expect(original.isMonitorEnabled)
         #expect(muted.isMonitorEnabled == false)
         #expect(muted.inputUID == "mic-uid")
-        #expect(muted.plugin == compressor)
+        #expect(muted.chain.slots.map(\.plugin) == [compressor])
         #expect(muted.isRunning)
     }
 
@@ -73,7 +73,7 @@ struct MonitorToggleTests {
 
         // Assert — the saved settings survive, and the absent field takes the safe default.
         #expect(decoded.inputUID == "BuiltInMicrophoneDevice")
-        #expect(decoded.plugin == compressor)
+        #expect(decoded.chain.slots.map(\.plugin) == [compressor])
         #expect(decoded.isRunning)
         #expect(decoded.isMonitorEnabled)
     }
@@ -106,49 +106,89 @@ struct SessionSnapshotTests {
         #expect(updated.isRunning)
     }
 
-    @Test("selecting a different plugin discards the previous plugin's state")
-    func switchingPluginDiscardsState() {
-        // A state blob is only meaningful to the plugin that produced it. Handing Vendor A's
-        // archive to Vendor B's plugin is, in-process, a plausible way to crash the host.
-        let saved = SessionSnapshot.empty
-            .settingPlugin(compressor)
-            .settingPluginState(Data([0x01, 0x02]))
+    @Test("a session file from before the chain existed loads as a one-slot chain")
+    func preChainFileMigrates() throws {
+        // Arrange — the single-slot format, exactly as written to disk before this change:
+        // a `plugin` object and a `pluginState` blob, with no `chain` key at all.
+        let legacy = Data("""
+        {
+          "inputUID" : "BuiltInMicrophoneDevice",
+          "isRunning" : true,
+          "isMonitorEnabled" : false,
+          "plugin" : {
+            "name" : "Compressor",
+            "manufacturer" : "Vendor A",
+            "componentType" : 1635083896,
+            "componentSubType" : 2,
+            "componentManufacturer" : 3
+          },
+          "pluginState" : "AQID"
+        }
+        """.utf8)
 
-        let switched = saved.settingPlugin(reverb)
+        // Act
+        let decoded = try JSONDecoder().decode(SessionSnapshot.self, from: legacy)
 
-        #expect(saved.pluginState != nil)
-        #expect(switched.plugin == reverb)
-        #expect(switched.pluginState == nil)
+        // Assert — the plugin *and* its dial positions survive the upgrade. Dropping the state
+        // here would silently reset the user's compressor on the launch after they update.
+        #expect(decoded.chain.slots.count == 1)
+        #expect(decoded.chain.slots[0].plugin == compressor)
+        #expect(decoded.chain.slots[0].state == Data([0x01, 0x02, 0x03]))
+        #expect(decoded.chain.slots[0].isBypassed == false)
+        #expect(decoded.inputUID == "BuiltInMicrophoneDevice")
+        #expect(decoded.isRunning)
+        #expect(decoded.isMonitorEnabled == false)
     }
 
-    @Test("re-selecting the same plugin keeps its state")
-    func reselectingSamePluginKeepsState() {
-        let saved = SessionSnapshot.empty
-            .settingPlugin(compressor)
-            .settingPluginState(Data([0x01]))
+    @Test("a pre-chain file with no plugin loads as an empty chain")
+    func preChainFileWithoutPluginMigrates() throws {
+        let legacy = Data("""
+        { "inputUID" : "mic-uid", "isRunning" : false }
+        """.utf8)
 
-        let same = saved.settingPlugin(compressor)
+        let decoded = try JSONDecoder().decode(SessionSnapshot.self, from: legacy)
 
-        #expect(same.pluginState == Data([0x01]))
+        #expect(decoded.chain.isEmpty)
+        #expect(decoded.inputUID == "mic-uid")
     }
 
-    @Test("clearing the plugin clears its state")
-    func clearingPluginClearsState() {
+    @Test("a chain survives a round trip through JSON with slot identity intact")
+    func chainRoundTripsThroughJSON() throws {
+        // Arrange — slot ids are what tie a saved slot to its open window and its live unit, so
+        // they have to come back the same, not merely equivalent.
+        let chain = PluginChain.empty
+            .adding(compressor)
+            .adding(reverb)
         let saved = SessionSnapshot.empty
-            .settingPlugin(compressor)
-            .settingPluginState(Data([0x01]))
+            .settingChain(chain.settingBypass(true, for: chain.slots[1].id))
 
-        let cleared = saved.settingPlugin(nil)
+        // Act
+        let data = try JSONEncoder().encode(saved)
+        let decoded = try JSONDecoder().decode(SessionSnapshot.self, from: data)
 
-        #expect(cleared.plugin == nil)
-        #expect(cleared.pluginState == nil)
+        // Assert
+        #expect(decoded == saved)
+        #expect(decoded.chain.slots.map(\.id) == chain.slots.map(\.id))
+        #expect(decoded.chain.slots[1].isBypassed)
     }
 
-    @Test("state cannot be attached without a plugin to own it")
-    func stateWithoutPluginIsIgnored() {
-        let orphaned = SessionSnapshot.empty.settingPluginState(Data([0x01]))
+    @Test("replacing the chain leaves every other field alone")
+    func settingChainIsNarrow() {
+        // Arrange
+        let original = SessionSnapshot.empty
+            .settingInput("mic-uid")
+            .settingRunning(true)
+            .settingMonitorEnabled(false)
 
-        #expect(orphaned.pluginState == nil)
+        // Act
+        let updated = original.settingChain(PluginChain.empty.adding(reverb))
+
+        // Assert
+        #expect(original.chain.isEmpty)
+        #expect(updated.chain.slots.map(\.plugin) == [reverb])
+        #expect(updated.inputUID == "mic-uid")
+        #expect(updated.isRunning)
+        #expect(updated.isMonitorEnabled == false)
     }
 }
 
@@ -200,10 +240,10 @@ struct SessionStoreTests {
     func saveThenLoadRoundTrips() throws {
         // Arrange
         let store = temporaryStore()
+        let chain = PluginChain.empty.adding(compressor)
         let snapshot = SessionSnapshot.empty
             .settingInput("mic-uid")
-            .settingPlugin(compressor)
-            .settingPluginState(Data([0x01, 0x02, 0x03]))
+            .settingChain(chain.settingState(Data([0x01, 0x02, 0x03]), for: chain.slots[0].id))
             .settingRunning(true)
 
         // Act

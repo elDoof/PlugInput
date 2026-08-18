@@ -18,12 +18,13 @@ struct ConsoleView: View {
             VStack(alignment: .leading, spacing: 16) {
                 transport
                 SignalChainView(model: model)
+                ChainEditorView(model: model)
                 LevelMeterView(peak: model.inputPeak, isRunning: model.isRunning)
                 ActivityView()
                 Spacer(minLength: 0)
             }
             .padding(16)
-            .frame(minWidth: 380)
+            .frame(minWidth: 420)
         }
         .frame(minWidth: 680, minHeight: 460)
         .task { await model.refresh() }
@@ -87,7 +88,10 @@ private struct SignalChainView: View {
             HStack(spacing: 8) {
                 stage(inputName, systemImage: "mic")
                 arrow
-                stage(model.selectedPlugin?.name ?? "No effect", systemImage: "slider.horizontal.3")
+                // Summarised rather than enumerated. The editor directly below lists every slot
+                // in order, and eight boxes would overflow this row; what this view is *for* is
+                // the routing around the effects — which mic in, which devices out.
+                stage(effectsLabel, systemImage: "slider.horizontal.3")
                 arrow
                 VStack(alignment: .leading, spacing: 4) {
                     stage(model.virtualDevice?.name ?? "BlackHole missing", systemImage: "waveform")
@@ -100,6 +104,23 @@ private struct SignalChainView: View {
 
     private var inputName: String {
         model.inputDevices.first { $0.uid == model.selectedInputUID }?.name ?? "No input"
+    }
+
+    /// One effect is worth naming; several are not worth crowding the row with. Bypassed slots
+    /// are counted out of the total, because "3 effects" while two are bypassed would be a
+    /// quietly wrong answer to "what is on my voice right now?".
+    private var effectsLabel: String {
+        let slots = model.chain.slots
+        let active = slots.filter { !$0.isBypassed }
+
+        switch (slots.count, active.count) {
+        case (0, _): return "No effect"
+        case (1, 0): return "\(slots[0].plugin.name) (bypassed)"
+        case (1, _): return slots[0].plugin.name
+        case (_, 0): return "\(slots.count) effects, all bypassed"
+        case let (total, live) where live < total: return "\(live) of \(total) effects"
+        default: return "\(slots.count) effects"
+        }
     }
 
     private var monitorLabel: String {

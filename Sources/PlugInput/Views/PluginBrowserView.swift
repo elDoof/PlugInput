@@ -49,18 +49,11 @@ struct PluginBrowserView: View {
     /// live, which a selection binding cannot express.
     private var list: some View {
         List {
-            Section {
-                row(title: "No effect", isSelected: model.selectedPlugin == nil) {
-                    await model.selectPlugin(nil)
-                }
-                .foregroundStyle(.secondary)
-            }
-
             ForEach(manufacturers, id: \.self) { manufacturer in
                 Section(manufacturer) {
                     ForEach(results.filter { $0.manufacturer == manufacturer }) { plugin in
-                        row(title: plugin.name, isSelected: model.selectedPlugin == plugin) {
-                            await model.selectPlugin(plugin)
+                        row(title: plugin.name, count: count(of: plugin)) {
+                            await model.addPlugin(plugin)
                         }
                     }
                 }
@@ -76,12 +69,12 @@ struct PluginBrowserView: View {
 
     private var footer: some View {
         HStack {
-            Button("Open Plugin Window") {
-                guard let effect = model.loadedEffect else { return }
-                pluginWindow.show(effect, title: model.selectedPlugin?.name ?? "Effect")
-            }
-            .disabled(model.loadedEffect == nil)
-            .help("Shows the plugin's own interface, drawn by the vendor")
+            // Opening a plugin's interface belongs to the chain editor now — there is one button
+            // per slot there, which is the only place that can say *which* instance to open.
+            Text(model.chain.isFull
+                 ? "Chain is full (\(PluginChain.maximumSlots))"
+                 : "Click to add to the chain")
+                .foregroundStyle(model.chain.isFull ? .orange : .secondary)
 
             Spacer()
 
@@ -92,11 +85,12 @@ struct PluginBrowserView: View {
         .padding(10)
     }
 
-    /// Loading a plugin rebuilds the graph, so a row shows it is working rather than appearing
-    /// to do nothing for the moment the engine cycles.
+    /// A row adds its plugin to the end of the chain. `count` is how many times it is already in
+    /// there — shown rather than prevented, because loading the same plugin twice is a legitimate
+    /// thing to want, and a badge answers "did my click register?" for a plugin already present.
     private func row(
         title: String,
-        isSelected: Bool,
+        count: Int,
         action: @escaping () async -> Void
     ) -> some View {
         Button {
@@ -105,13 +99,23 @@ struct PluginBrowserView: View {
             HStack {
                 Text(title).lineLimit(1)
                 Spacer()
-                if isSelected {
-                    Image(systemName: "checkmark").font(.caption).foregroundStyle(.tint)
+                if count > 0 {
+                    Text(count == 1 ? "in chain" : "×\(count)")
+                        .font(.caption2)
+                        .foregroundStyle(.tint)
                 }
+                Image(systemName: "plus.circle")
+                    .font(.caption)
+                    .foregroundStyle(model.chain.isFull ? .tertiary : .secondary)
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(model.chain.isFull)
+    }
+
+    private func count(of plugin: PluginDescriptor) -> Int {
+        model.chain.slots.count { $0.plugin == plugin }
     }
 
     private var results: [PluginDescriptor] {

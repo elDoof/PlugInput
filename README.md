@@ -6,7 +6,7 @@ Run a compressor — or a de-esser, an EQ, a reverb — on your voice without op
 have Zoom, Discord, Slack, or OBS receive the processed signal as a microphone.
 
 ```
-mic → [Audio Unit effect] → private aggregate device → headphones + BlackHole 2ch
+mic → [Audio Unit effects] → private aggregate device → headphones + BlackHole 2ch
                                                                     ↑
                                           other apps select this as their microphone
 ```
@@ -23,7 +23,7 @@ other applications, and it must be installed separately.
 ## Build and run
 
 ```bash
-swift build && swift test     # library + 50 unit tests
+swift build && swift test     # library + 63 unit tests
 ./make-app.sh release         # assembles PlugInput.app
 open PlugInput.app            # a waveform icon appears in the menu bar
 ```
@@ -38,13 +38,25 @@ To stop it: `killall PlugInput`, or Quit from the menu.
 
 1. Click the waveform icon in the menu bar.
 2. Pick your **Input** — your microphone or audio interface.
-3. Click the **Effect** row to open the browser, and search the Audio Units you have installed
-   (677 on the development machine). Pick one.
+3. Click the **Effect chain** row to open the window, and search the Audio Units you have
+   installed (677 on the development machine). Click one to add it to the chain.
 4. Press **Start**.
 5. In Zoom / Discord / OBS, select **BlackHole 2ch** as the microphone.
 
-**Open** shows the plugin's own interface, drawn by its vendor. Knob positions are saved
-automatically and restored on the next launch, along with your device and effect.
+### The chain
+
+Effects run top to bottom, in the order shown. Up to 8 of them, and the same plugin may appear
+more than once. Each row in the window has:
+
+- **↑ / ↓** — move the effect earlier or later in the chain.
+- **Bypass** — take it out of the signal without removing it or losing its settings. This one is
+  instant; adding, removing, and reordering rebuild the audio graph and cost a brief dropout.
+- **Sliders icon** — open that plugin's own interface, drawn by its vendor. Several can be open
+  at once.
+- **Trash** — remove it from the chain.
+
+Knob positions are saved automatically for every plugin and restored on the next launch, along
+with your device, the chain order, and which effects were bypassed.
 
 ### Monitoring
 
@@ -73,7 +85,7 @@ Most common cause of silence: **microphone permission**. A microphone macOS has 
 returns silence rather than an error, and every layer reports success. Check System Settings →
 Privacy & Security → Microphone.
 
-`~/Library/Application Support/PlugInput/session.json` records which plugin loaded and whether
+`~/Library/Application Support/PlugInput/session.json` records the chain that loaded and whether
 the engine actually started. Delete it to reset the app to defaults.
 
 To verify the audio path itself, independently of the UI, the Phase 0 harness listens on the
@@ -90,12 +102,12 @@ number.
 
 ## Known limitations
 
-- **One effect slot.** A deliberate scope cut, not an oversight. An ordered chain is the next
-  significant feature.
 - **Other apps see "BlackHole 2ch", not "PlugInput".** Presenting a device under our own name
   is not achievable with CoreAudio aggregates — two approaches were built and measured, and
   both fail. See gotchas #17 and #19 in [CLAUDE.md](CLAUDE.md). Doing it properly means shipping
   a real CoreAudio HAL driver.
+- **Eight effects maximum.** Each one is loaded in-process and adds latency; the window shows
+  the running total, and warns above ~5 ms because that is where talking over it gets hard.
 - **Plugins load in-process.** `.loadOutOfProcess` is AUv3-only and most installed Audio Units
   are AUv2, so a crashing plugin takes the app down with it. A deliberate compatibility
   tradeoff; session state is autosaved partly because of it.
@@ -110,13 +122,13 @@ Sources/AudioCore/       no UI imports — the testable half
   Devices/     CoreAudioProperties, DeviceEnumerator, AggregateDeviceBuilder,
                InputSelection, DeviceDiscovery, VirtualMicrophone
   Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel, ObjCExceptionBarrier
-  Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch
+  Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch, PluginChain
   Persistence/ SessionSnapshot, SessionStore
   Diagnostics/ EngineLog, EngineLogReader, AudioLevel
 Sources/ObjCExceptionBridge/  @try/@catch around AVAudioEngine's raising graph calls
 Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindowController
-  Views/       ConsoleView, PluginBrowserView
-Tests/AudioCoreTests/    50 tests
+  Views/       ConsoleView, ChainEditorView, PluginBrowserView
+Tests/AudioCoreTests/    63 tests
 Spike/                   Phase 0 verification harness — separate package
 ```
 
@@ -130,7 +142,7 @@ renders audio but delivers nothing, and the input channel map is what stops Blac
 input channels — which carry whatever was just written to it — from closing a feedback loop.
 
 **[CLAUDE.md](CLAUDE.md) is the engineering companion to this file**: the decisions that are
-settled, and twenty gotchas that each cost real debugging time. Every one of them fails
+settled, and twenty-one gotchas that each cost real debugging time. Every one of them fails
 silently. Read it before changing the device or channel-map code.
 
 ## Why Audio Units rather than VST3

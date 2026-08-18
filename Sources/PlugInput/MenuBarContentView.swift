@@ -84,32 +84,30 @@ struct MenuBarContentView: View {
         )
     }
 
+    /// A read-only summary. Editing the chain — adding, reordering, bypassing — happens in the
+    /// window, where there is room for it. This popover is 320pt wide, and its job is to answer
+    /// "what is on my voice right now?" at a glance and then get out of the way.
     private var pluginPicker: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Effect").font(.caption).foregroundStyle(.secondary)
-            HStack {
-                // Choosing happens in the window, where there is room to search. A flat picker
-                // over 677 components was never a usable chooser.
-                Button {
-                    openConsole()
-                } label: {
-                    HStack {
-                        Text(model.selectedPlugin?.name ?? "No effect")
-                            .lineLimit(1)
-                        Spacer()
-                        Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.bordered)
+            Text("Effect chain").font(.caption).foregroundStyle(.secondary)
 
-                Button("Open") {
-                    if let effect = model.loadedEffect {
-                        pluginWindow.show(effect, title: model.selectedPlugin?.name ?? "Effect")
+            Button {
+                openConsole()
+            } label: {
+                HStack {
+                    if model.chain.isEmpty {
+                        Text("No effects").foregroundStyle(.secondary)
+                    } else {
+                        Text(chainSummary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
                     }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary)
                 }
-                .disabled(model.loadedEffect == nil)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.bordered)
 
             if model.effectLatencyMilliseconds > 5 {
                 // Linear-phase EQs and mastering plugins report tens of milliseconds, which
@@ -122,11 +120,12 @@ struct MenuBarContentView: View {
         }
     }
 
-    private var pluginSelection: Binding<PluginDescriptor?> {
-        Binding(
-            get: { model.selectedPlugin },
-            set: { newValue in Task { await model.selectPlugin(newValue) } }
-        )
+    /// Signal order, with bypassed slots struck through in words rather than styling — this is
+    /// one `Text`, and a bypassed plugin still sitting in the chain is worth saying out loud.
+    private var chainSummary: String {
+        model.chain.slots
+            .map { $0.isBypassed ? "(\($0.plugin.name))" : $0.plugin.name }
+            .joined(separator: " → ")
     }
 
     private var meter: some View {

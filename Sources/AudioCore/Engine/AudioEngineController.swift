@@ -37,7 +37,9 @@ public final class AudioEngineController: @unchecked Sendable {
     // Touched only on `queue`.
     private let engine = AVAudioEngine()
     private var aggregate: AggregateDevice?
-    private var effectNode: AVAudioUnit?
+    /// The chain's units, in signal order. Held so teardown can detach every one of them —
+    /// a unit left attached to a stopped engine is a leak the next start inherits.
+    private var effectNodes: [AVAudioUnit] = []
 
     /// Whether a tap is currently installed on the input node's bus 0.
     ///
@@ -73,11 +75,12 @@ public final class AudioEngineController: @unchecked Sendable {
     /// of hiding it behind an implicit capture — the compiler cannot prove this safe, so the
     /// claim belongs in the open. What makes it hold: the UI only ever hands a unit *over*, and
     /// never mutates one the engine is using.
-    public struct Effect: @unchecked Sendable {
-        public let unit: AVAudioUnit?
+    public struct Effects: @unchecked Sendable {
+        /// In signal order: the input feeds `units[0]`, and the last one feeds the mixer.
+        public let units: [AVAudioUnit]
 
-        public init(_ unit: AVAudioUnit?) {
-            self.unit = unit
+        public init(_ units: [AVAudioUnit]) {
+            self.units = units
         }
     }
 
@@ -86,7 +89,7 @@ public final class AudioEngineController: @unchecked Sendable {
         let input: AudioDevice
         let monitor: AudioDevice
         let virtual: AudioDevice
-        let effect: Effect
+        let effects: Effects
         let isMonitorEnabled: Bool
     }
 
@@ -98,14 +101,14 @@ public final class AudioEngineController: @unchecked Sendable {
         input: AudioDevice,
         monitor: AudioDevice,
         virtual: AudioDevice,
-        effect: Effect,
+        effects: Effects,
         isMonitorEnabled: Bool = true
     ) async throws {
         let request = StartRequest(
             input: input,
             monitor: monitor,
             virtual: virtual,
-            effect: effect,
+            effects: effects,
             isMonitorEnabled: isMonitorEnabled
         )
 
@@ -169,7 +172,7 @@ public final class AudioEngineController: @unchecked Sendable {
             try applyInputChannelMap(inputUID: input.uid, layout: device.layout)
 
             try buildGraph(
-                effect: request.effect.unit,
+                effects: request.effects.units,
                 virtual: virtual,
                 monitor: monitor,
                 layout: device.layout,
@@ -201,10 +204,10 @@ public final class AudioEngineController: @unchecked Sendable {
         if engine.isRunning {
             ignoringObjCException("stopping engine") { engine.stop() }
         }
-        if let effectNode {
-            ignoringObjCException("detaching effect") { engine.detach(effectNode) }
-            self.effectNode = nil
+        for node in effectNodes {
+            ignoringObjCException("detaching effect") { engine.detach(node) }
         }
+        effectNodes = []
         aggregate?.destroy()
         aggregate = nil
         peakLevel.reset()
@@ -248,7 +251,7 @@ public final class AudioEngineController: @unchecked Sendable {
     // MARK: - Graph
 
     private func buildGraph(
-        effect: AVAudioUnit?,
+        effects: [AVAudioUnit],
         virtual: AudioDevice,
         monitor: AudioDevice,
         layout: AggregateChannelLayout,
@@ -288,19 +291,30 @@ public final class AudioEngineController: @unchecked Sendable {
         // this function's `throws` and aborts the process. The labels are what name the failing
         // step afterwards, since the exception text says what the runtime objected to but never
         // which call it came from.
-        if let effect {
-            try withGraphBarrier("attaching effect") {
+        // Attach every unit before wiring any of them: `connect` requires both endpoints to be
+        // attached, and doing it in one pass keeps `effectNodes` complete for teardown even if a
+        // later connect raises.
+        for effect in effects {
+            try withGraphBarrier("attaching \(effect.auAudioUnit.componentName ?? "effect")") {
                 engine.attach(effect)
-                // Recorded before the connects, so a raise part-way through still leaves
-                // `stopOnQueue` something to detach.
-                effectNode = effect
-                engine.connect(inputNode, to: effect, format: inputFormat)
-                engine.connect(effect, to: mixer, format: inputFormat)
+                // Recorded as we go, so a raise part-way through still leaves `stopOnQueue`
+                // every unit it needs to detach.
+                effectNodes.append(effect)
             }
-        } else {
-            try withGraphBarrier("connecting input to mixer") {
-                engine.connect(inputNode, to: mixer, format: inputFormat)
+        }
+
+        // The chain, in order: input → effects[0] → … → effects[n-1] → mixer. With no effects
+        // this collapses to the single input → mixer connection, which is exactly what the
+        // one-slot version did.
+        var source: AVAudioNode = inputNode
+        for (index, effect) in effects.enumerated() {
+            try withGraphBarrier("connecting chain position \(index + 1)") {
+                engine.connect(source, to: effect, format: inputFormat)
             }
+            source = effect
+        }
+        try withGraphBarrier("connecting chain to mixer") {
+            engine.connect(source, to: mixer, format: inputFormat)
         }
 
         try withGraphBarrier("connecting mixer to output") {
@@ -314,8 +328,10 @@ public final class AudioEngineController: @unchecked Sendable {
         // through unchanged; this only adds cover for the ones it raises instead.
         try withGraphBarrier("starting engine") { try engine.start() }
 
-        // Published for the UI's latency badge — read it here, on the queue that owns the node.
-        publish(effectLatency: effect?.auAudioUnit.latency ?? 0)
+        // Published for the UI's latency badge — read here, on the queue that owns the nodes.
+        // Summed across the chain, because latency accumulates: four plugins at 3 ms each is
+        // 12 ms of delay on the user's own voice, which is the number that matters to them.
+        publish(effectLatency: effects.reduce(0) { $0 + $1.auAudioUnit.latency })
 
         EngineLog.logger.info(
             """
@@ -323,7 +339,7 @@ public final class AudioEngineController: @unchecked Sendable {
             \(inputFormat.sampleRate, privacy: .public)Hz, device \
             \(deviceFormat.channelCount, privacy: .public)ch @ \
             \(deviceFormat.sampleRate, privacy: .public)Hz, \
-            effect \(effect?.auAudioUnit.componentName ?? "none", privacy: .public)
+            chain \(Self.describe(effects), privacy: .public)
             """
         )
 
@@ -334,6 +350,17 @@ public final class AudioEngineController: @unchecked Sendable {
             layout: layout,
             isMonitorEnabled: isMonitorEnabled
         )
+    }
+
+    /// The chain as one log-friendly line: "LALA → Pro-L 2", or "none" when empty.
+    ///
+    /// Worth logging in full rather than as a count. The order is the thing that decides what
+    /// the signal sounds like, and it is the thing the log cannot otherwise show.
+    nonisolated static func describe(_ effects: [AVAudioUnit]) -> String {
+        guard !effects.isEmpty else { return "none" }
+        return effects
+            .map { $0.auAudioUnit.componentName ?? "unnamed" }
+            .joined(separator: " → ")
     }
 
     /// Installs the metering tap, having first guaranteed the bus is free.

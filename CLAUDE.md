@@ -8,7 +8,7 @@ OBS see the processed signal as a microphone.
 
 Last verified 2026-08-15: **mic → AnalogObsession LALA → private aggregate → BlackHole**,
 measured from a separate process at **−34.0 dBFS broadband** against a −120.0 dBFS silence
-control. Also verified: 50/50 tests, `PlugInput.app` launches and stays resident, 677 AU
+control. Also verified: 63/63 tests, `PlugInput.app` launches and stays resident, 677 AU
 effects discovered, no orphaned aggregates, plugin switching survives an engine restart, the
 monitor toggle mutes only the monitor leg, and session persistence against a real Audio Unit.
 
@@ -50,7 +50,7 @@ reading those two entries — the remaining route is a real HAL driver.
 ## Build and run
 
 ```bash
-swift build && swift test     # library + 50 unit tests
+swift build && swift test     # library + 63 unit tests
 ./make-app.sh release         # assembles PlugInput.app
 open PlugInput.app            # waveform icon appears in the menu bar
 killall PlugInput
@@ -85,18 +85,19 @@ Sources/AudioCore/       no UI imports — the testable half
   Devices/     CoreAudioProperties, DeviceEnumerator, AggregateDeviceBuilder, InputSelection,
                DeviceDiscovery, VirtualMicrophone (naming constants — see gotchas #17, #19)
   Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel, ObjCExceptionBarrier
-  Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch
+  Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch, PluginChain
   Persistence/ SessionSnapshot, SessionStore
   Diagnostics/ EngineLog, EngineLogReader, AudioLevel
 Sources/ObjCExceptionBridge/  the only Objective-C in the project — @try/@catch, see gotcha #21
 Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindowController,
                          LoginItem
-  Views/       ConsoleView (window: chain, meter, activity), PluginBrowserView (search)
-Tests/AudioCoreTests/    50 tests
+  Views/       ConsoleView (window: routing, meter, activity), ChainEditorView (reorder,
+               bypass, remove), PluginBrowserView (search, adds to the chain)
+Tests/AudioCoreTests/    63 tests
 Spike/                 Phase 0 verification harness — separate package, kept as reference
 ```
 
-Signal path: **mic → [effect] → private aggregate device → headphones + BlackHole 2ch**.
+Signal path: **mic → [effect chain] → private aggregate device → headphones + BlackHole 2ch**.
 Other apps select BlackHole as their microphone. BlackHole was already installed on this
 machine; the app does not ship a driver.
 
@@ -109,7 +110,9 @@ machine; the app does not ship a driver.
   `requestViewController`, and avoids JUCE and its GPL/commercial licensing question entirely.
 - **Both monitoring and virtual mic**, not one or the other.
 - **Menu bar utility** (`MenuBarExtra`), not a windowed app.
-- **One effect slot in v1**, not a chain — a deliberate scope cut, not an oversight.
+- **An ordered chain of up to 8 effects**, each with its own settings and bypass. v1 shipped
+  one slot as a deliberate scope cut; the chain replaced it without touching the device or
+  channel-map logic, exactly as that cut predicted.
 
 ## Phase 0: the routing is proven
 
@@ -272,18 +275,25 @@ silence rather than an error.
 ## Persistence
 
 `~/Library/Application Support/PlugInput/session.json` holds one `SessionSnapshot`:
-`inputUID`, `plugin` (the component triple, not the display name), `pluginState` (base64 of a
-binary plist of `auAudioUnit.fullState`), `isRunning`, and `isMonitorEnabled`.
+`inputUID`, `chain`, `isRunning`, and `isMonitorEnabled`. `chain` is an ordered list of slots,
+each carrying an `id`, its `plugin` (the component triple, not the display name), `state`
+(base64 of a binary plist of `auAudioUnit.fullState`), and `isBypassed`.
 
-`isMonitorEnabled` decodes with `decodeIfPresent ?? true` through a hand-written `init(from:)`.
-That is load-bearing: a synthesised `Codable` treats a missing key for a non-optional property
-as a decoding *failure*, and `AppModel` answers a failed load by discarding the whole session —
-so adding any field to this struct without that would silently wipe a user's saved plugin and
-device on the next launch. Covered by a test that decodes a pre-toggle session file.
+**Both older shapes still decode**, through a hand-written `init(from:)`. That is load-bearing
+twice over. A synthesised `Codable` treats a missing key for a non-optional property as a
+decoding *failure*, and `AppModel` answers a failed load by discarding the whole session — so
+`isMonitorEnabled` decodes with `decodeIfPresent ?? true`, and adding any field without that
+would silently wipe a user's saved setup. And a pre-chain file carries `plugin` + `pluginState`
+instead of `chain`; those migrate into a **one-slot chain with the state intact** rather than
+being dropped, because the point of saving dial positions is that upgrading does not cost them.
+Three tests cover it, and it was verified against a real pre-chain file: Pro-L 2 and its 604-byte
+state blob came through.
 
-Written on every user choice, on a
-30-second autosave while a plugin is loaded, and on quit; read once at launch by
-`AppModel.restore()`, which reinstates the plugin and resumes the engine if it was running.
+Written on every user choice, on a 30-second autosave while any plugin is loaded, and on quit;
+read once at launch by `AppModel.restore()`, which reinstates the whole chain in order and
+resumes the engine if it was running. A slot whose plugin no longer instantiates is **dropped**
+from the chain and logged, rather than left as a gap — a chain that reads as four effects while
+three are audible is exactly the silent discrepancy this app exists to avoid.
 
 Two invariants are load-bearing. `SessionSnapshot` drops `pluginState` whenever `plugin`
 changes — a state blob means nothing to a different plugin, and feeding it to one in-process
@@ -295,11 +305,6 @@ whether the engine actually started. Delete it to reset the app.
 
 ## Next steps
 
-- **#5 Chain:** immutable `PluginChain` (`adding`/`removing`/`moving`/`settingBypass` returning
-  new values), with `AudioEngineController` diffing and rewiring `buildGraph`. `SessionSnapshot`
-  grows from one `plugin` + `pluginState` to an ordered list; the invariant that state travels
-  with its own plugin is what keeps that small. Touches `AppModel` and `buildGraph` only — not
-  the device or channel-map logic.
 - **Naming the mic "PlugInput" is closed off with aggregates — do not try a third time.**
   Both routes were built and measured, and both failed: a second public aggregate wrapping
   BlackHole delivers silence (gotcha #17), and reordering the engine's own aggregate to lead

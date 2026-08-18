@@ -23,8 +23,23 @@ final class AppModel {
     private(set) var monitorDevice: AudioDevice?
 
     private(set) var selectedInputUID: String?
-    private(set) var selectedPlugin: PluginDescriptor?
-    private(set) var loadedEffect: AVAudioUnit?
+
+    /// The ordered effect chain, as an immutable value. Every edit computes a new one and
+    /// persists it, so a failed rebuild cannot leave the saved chain half-changed.
+    private(set) var chain: PluginChain = .empty
+
+    /// The live Audio Units, keyed by the slot that owns each one.
+    ///
+    /// Kept beside the chain rather than inside it: `PluginChain` is a `Sendable` value that gets
+    /// written to disk, and an `AVAudioUnit` is neither of those things. The slot id is what ties
+    /// the two together — which is also why slots carry an id rather than being addressed by
+    /// index, since a reorder would otherwise repoint every unit at its neighbour.
+    private(set) var loadedUnits: [UUID: AVAudioUnit] = [:]
+
+    /// The chain's units in signal order, skipping any slot whose plugin failed to load.
+    var orderedUnits: [AVAudioUnit] {
+        chain.slots.compactMap { loadedUnits[$0.id] }
+    }
 
     private(set) var isRunning = false
     private(set) var isMonitorEnabled = true
@@ -63,6 +78,9 @@ final class AppModel {
         }
         selectedInputUID = snapshot.inputUID
         isMonitorEnabled = snapshot.isMonitorEnabled
+        // Shown immediately, before the units behind it exist — `restore()` instantiates those
+        // asynchronously, and a chain that appeared one plugin at a time would read as data loss.
+        chain = snapshot.chain
 
         // ⌘Q, logout, and the Quit button all end up here. The aggregate device must be
         // destroyed on *every* exit path or it outlives the process (gotcha #7).
@@ -114,9 +132,8 @@ final class AppModel {
 
         await refresh()
 
-        if let plugin = snapshot.plugin {
-            await load(plugin, state: snapshot.pluginState)
-        }
+        await loadChain(snapshot.chain)
+
         if snapshot.isRunning {
             await start()
         }
@@ -206,52 +223,111 @@ final class AppModel {
         await restartIfRunning()
     }
 
-    // MARK: - Plugin slot
+    // MARK: - Chain
 
-    func selectPlugin(_ descriptor: PluginDescriptor?) async {
-        EngineLog.logger.info("effect selected: \(descriptor?.name ?? "none", privacy: .public)")
-        // Drops any saved state along with the outgoing plugin — a state blob is only
-        // meaningful to the plugin that produced it.
-        update { $0.settingPlugin(descriptor) }
-
-        guard let descriptor else {
-            unload()
-            await restartIfRunning()
+    /// Appends an effect to the end of the chain.
+    ///
+    /// The unit is instantiated *before* the new chain is adopted, so a plugin that fails to load
+    /// leaves both the chain and the engine exactly as they were rather than adding an empty slot
+    /// the graph would silently skip.
+    func addPlugin(_ descriptor: PluginDescriptor) async {
+        let grown = chain.adding(descriptor)
+        guard grown != chain, let slot = grown.slots.last else {
+            status = "Chain is full — \(PluginChain.maximumSlots) effects is the limit."
             return
         }
 
-        await load(descriptor, state: nil)
+        EngineLog.logger.info("chain: added \(descriptor.name, privacy: .public)")
+        guard await instantiate(slot) else { return }
+        apply(grown)
         await restartIfRunning()
     }
 
-    private func load(_ descriptor: PluginDescriptor, state: Data?) async {
-        do {
-            let unit = try await PluginCatalog.instantiate(descriptor)
-            selectedPlugin = descriptor
-            loadedEffect = unit
-            status = ""
+    func removeSlot(_ id: UUID) async {
+        guard let slot = chain.slot(id) else { return }
+        EngineLog.logger.info("chain: removed \(slot.plugin.name, privacy: .public)")
 
-            if let state {
+        loadedUnits[id] = nil
+        apply(chain.removing(id))
+        if chain.isEmpty { stopAutosave() }
+        await restartIfRunning()
+    }
+
+    /// Moves a slot by one position. A no-op move never touches the engine — the buttons at the
+    /// ends of the chain are disabled, but a dropout for a reorder that did not happen would be
+    /// a poor way to find that out.
+    func moveSlot(_ id: UUID, by offset: Int) async {
+        let reordered = chain.moving(id, by: offset)
+        guard reordered != chain else { return }
+
+        let order = reordered.slots.map(\.plugin.name).joined(separator: " → ")
+        EngineLog.logger.info("chain: reordered to \(order, privacy: .public)")
+        apply(reordered)
+        await restartIfRunning()
+    }
+
+    /// The one chain edit that does not rebuild the graph.
+    ///
+    /// Bypass maps onto `shouldBypassEffect` on the unit itself, which is live — so unlike add,
+    /// remove and reorder, this costs no dropout. That is what makes it usable for actually
+    /// comparing a plugin in and out while talking.
+    func setBypass(_ isBypassed: Bool, for id: UUID) {
+        loadedUnits[id]?.auAudioUnit.shouldBypassEffect = isBypassed
+        apply(chain.settingBypass(isBypassed, for: id))
+    }
+
+    /// Adopts a new chain and writes it out. Never partially applied: the value is computed
+    /// first, then stored and persisted together.
+    private func apply(_ newChain: PluginChain) {
+        chain = newChain
+        update { $0.settingChain(newChain) }
+    }
+
+    /// Brings a saved chain back to life, in order.
+    ///
+    /// Slots whose plugin no longer instantiates — uninstalled since last launch, or a vendor
+    /// update that broke it — are dropped from the chain rather than kept as gaps. Keeping them
+    /// would mean a chain that reads as four effects while three are audible, which is exactly
+    /// the kind of silent discrepancy this app is built to avoid.
+    private func loadChain(_ saved: PluginChain) async {
+        var loaded: [PluginSlot] = []
+        for slot in saved.slots where await instantiate(slot) {
+            loaded.append(slot)
+        }
+
+        let restored = PluginChain(slots: loaded)
+        if restored != saved {
+            EngineLog.logger.error(
+                "chain: \(saved.slots.count - loaded.count, privacy: .public) saved effect(s) could not be loaded and were dropped"
+            )
+        }
+        apply(restored)
+    }
+
+    /// Instantiates one slot's plugin and files the unit under that slot's id.
+    @discardableResult
+    private func instantiate(_ slot: PluginSlot) async -> Bool {
+        do {
+            let unit = try await PluginCatalog.instantiate(slot.plugin)
+
+            if let state = slot.state {
                 do {
                     try PluginState.apply(state, to: unit)
                 } catch {
                     // The plugin is loaded and usable; only its saved dial positions were lost.
-                    status = "\(descriptor.name) loaded with default settings — its saved "
+                    status = "\(slot.plugin.name) loaded with default settings — its saved "
                         + "settings could not be restored."
                 }
             }
-            startAutosave()
-        } catch {
-            unload()
-            update { $0.settingPlugin(nil) }
-            status = "Could not load \(descriptor.name): \(error.localizedDescription)"
-        }
-    }
+            unit.auAudioUnit.shouldBypassEffect = slot.isBypassed
 
-    private func unload() {
-        stopAutosave()
-        loadedEffect = nil
-        selectedPlugin = nil
+            loadedUnits[slot.id] = unit
+            startAutosave()
+            return true
+        } catch {
+            status = "Could not load \(slot.plugin.name): \(error.localizedDescription)"
+            return false
+        }
     }
 
     /// Changing the graph requires a stop/start cycle. That costs a brief dropout, which is a
@@ -321,7 +397,7 @@ final class AppModel {
                 input: input,
                 monitor: monitorDevice,
                 virtual: virtualDevice,
-                effect: .init(loadedEffect),
+                effects: .init(orderedUnits),
                 isMonitorEnabled: isMonitorEnabled
             )
             isRunning = true
@@ -394,21 +470,27 @@ final class AppModel {
         }
     }
 
-    /// Writes the session out with the plugin's *live* settings folded in.
+    /// Writes the session out with every plugin's *live* settings folded in.
     private func persistSession(_ transform: (SessionSnapshot) -> SessionSnapshot = { $0 }) {
-        update { transform($0.settingPluginState(capturedPluginState())) }
+        chain = chain.settingStates(capturedStates())
+        update { transform($0.settingChain(chain)) }
     }
 
-    private func capturedPluginState() -> Data? {
-        guard let loadedEffect, snapshot.plugin != nil else { return snapshot.pluginState }
-
-        do {
-            return try PluginState.capture(from: loadedEffect)
-        } catch {
-            status = "Could not read \(selectedPlugin?.name ?? "the plugin")'s settings: "
-                + error.localizedDescription
-            return snapshot.pluginState
+    /// Reads each loaded unit's current settings. A plugin that refuses keeps whatever was saved
+    /// before rather than losing its slot's settings — one uncooperative plugin must not wipe the
+    /// rest of the chain.
+    private func capturedStates() -> [UUID: Data] {
+        var states: [UUID: Data] = [:]
+        for slot in chain.slots {
+            guard let unit = loadedUnits[slot.id] else { continue }
+            do {
+                states[slot.id] = try PluginState.capture(from: unit)
+            } catch {
+                status = "Could not read \(slot.plugin.name)'s settings: "
+                    + error.localizedDescription
+            }
         }
+        return states
     }
 
     // MARK: - Timers
