@@ -6,9 +6,10 @@ OBS see the processed signal as a microphone.
 
 ## Status: working and in daily use
 
-Last verified 2026-08-16: **mic → LALA → Pro-L 2 → LALA → private aggregate → BlackHole**,
-measured from a separate process at **−17.8 dBFS broadband** against a −120.0 dBFS silence
-control. Also verified: 63/63 tests, `PlugInput.app` launches and stays resident, 677 AU
+Last verified 2026-08-18: **mic → Pro-L 2 → private aggregate → PlugInput**, measured from a
+separate process at **−33.4 dBFS broadband** against a −120.0 dBFS silence control, with the
+app's own log line reading `virtual PlugInput`. The renamed HAL driver was measured separately
+at **−14.0 dBFS bit-exact** on the two-process tone test (gotcha #22). Also verified: 63/63 tests, `PlugInput.app` launches and stays resident, 677 AU
 effects discovered, no orphaned aggregates, a three-plugin chain wires in the logged order
 (duplicates included), a pre-chain `session.json` migrates with its state intact, the monitor
 toggle mutes only the monitor leg, and the exception barrier catches a real double-tap raise.
@@ -20,7 +21,7 @@ Ask the user rather than assuming, and see "Working on this".
 Reproduce it with the app running and a plugin loaded:
 
 ```bash
-cd Spike && ./.build/debug/PlugInputSpike listen 4 BlackHole
+cd Spike && ./.build/debug/PlugInputSpike listen 4 PlugInput
 ```
 
 Broadband well above −120.0 dBFS is the proof. Two traps in reading that number: ignore the
@@ -61,6 +62,7 @@ Two standing non-deliveries, both deliberate:
 
 ```bash
 swift build && swift test     # library + 63 unit tests
+./make-driver.sh install      # builds + installs the PlugInput HAL driver (sudo, once)
 ./make-app.sh release         # assembles PlugInput.app
 open PlugInput.app            # waveform icon appears in the menu bar
 killall PlugInput
@@ -107,9 +109,11 @@ Tests/AudioCoreTests/    63 tests
 Spike/                 Phase 0 verification harness — separate package, kept as reference
 ```
 
-Signal path: **mic → [effect chain] → private aggregate device → headphones + BlackHole 2ch**.
-Other apps select BlackHole as their microphone. BlackHole was already installed on this
-machine; the app does not ship a driver.
+Signal path: **mic → [effect chain] → private aggregate device → headphones + PlugInput**.
+Other apps select **PlugInput** as their microphone — a CoreAudio HAL driver this project builds
+and installs via `make-driver.sh` (gotcha #22). BlackHole is still installed on this machine
+alongside it, and other software still points at it; the two coexist because the driver carries
+its own name, bundle id, and UID.
 
 ## Decisions already made — do not relitigate
 
@@ -256,8 +260,8 @@ silence rather than an error.
     `AudioUnitSetProperty` and *reads back correctly* — then zeroes the output HW format
     (`outputNode.output 0ch` versus `2ch` when working) and the start fails. Another instance of
     gotcha #5: the write succeeding and the read-back matching still proved nothing.
-    **Users select BlackHole.** Any future attempt needs a real virtual driver, not an
-    aggregate.
+    Any route to the name needs a real virtual driver, not an aggregate — which is what
+    `make-driver.sh` now ships. See gotcha #22.
 20. **A stale aggregate blocks every future start.** An exit that skips teardown — crash, force
     quit, `killall` — leaves the aggregate behind, and `AudioHardwareCreateAggregateDevice` then
     refuses the same UID with `OSStatus 1852797029 ('nope')`, failing *every* subsequent start
@@ -281,6 +285,20 @@ silence rather than an error.
     each catch leaks a little. Both beat dying. Verified against the real thing — a test installs
     a second tap on an occupied bus and asserts the resulting
     `required condition is false: nullptr == Tap()` arrives as a catchable Swift error.
+22. **The renamed driver must be built from BlackHole v0.6.1. v0.7.1 enumerates perfectly and
+    carries silence.** Same trap as #17, one layer lower. A v0.7.1 build gets the right name, the
+    right UID, opens at 2ch/48kHz, and `coreaudiod` even spawns its driver process — then a
+    two-process test reads **−120.0 dBFS** while the identical test against stock BlackHole reads
+    −14.0. The mechanism is in `BlackHole.c`: the input path zero-fills whenever
+    `gMute_Master_Value || lastOutputSampleTime - inIOBufferFrameSize < mInputTime.mSampleTime`,
+    and 0.7.1 fails that second clause. Defaults are volume 1.0 / mute false, so it is the
+    "is anything writing?" test failing, not a mute. Renamed **v0.6.1 measures −14.0 dBFS,
+    bit-exact**, which is why `make-driver.sh` pins it. The 0.7.1 root cause was never chased —
+    pinning was cheaper. Do not bump the tag without re-running `Spike/` and reading a number.
+    Two further facts worth keeping: a **self-signed, un-notarized HAL driver loads fine** (this
+    was the open question before building anything), and the driver's UID is derived from its
+    name — `kDevice_UID = kDriver_Name + "%ich" + "_UID"` → `PlugInput2ch_UID` — so renaming the
+    driver silently changes what `VirtualMicrophone.driverUID` must match.
 
 ## Persistence
 
@@ -315,15 +333,15 @@ whether the engine actually started. Delete it to reset the app.
 
 ## Next steps
 
-- **Naming the mic "PlugInput" is closed off with aggregates — do not try a third time.**
-  Both routes were built and measured, and both failed: a second public aggregate wrapping
-  BlackHole delivers silence (gotcha #17), and reordering the engine's own aggregate to lead
-  with BlackHole breaks `engine.start()` outright (gotcha #19). Renaming BlackHole is not
-  possible either — `kAudioObjectPropertyName` is not settable. The only remaining route is
-  **shipping an actual virtual audio driver** (a CoreAudio HAL plugin, i.e. what BlackHole
-  itself is) under our own name, which is a substantially larger piece of work and would mean
-  the app installs a system driver. Until then, users select BlackHole, and
-  `VirtualMicrophone` holds only the naming constants plus the write-up of why.
+- **Naming the mic "PlugInput" is DONE — via a driver, not an aggregate.** `make-driver.sh`
+  builds a renamed BlackHole (`kDriver_Name` / `kDevice_Name`, pinned to v0.6.1) and installs it
+  to `/Library/Audio/Plug-Ins/HAL`. Other apps now select **PlugInput**. The aggregate routes
+  stay closed — do not revisit #17 or #19 — but the conclusion drawn from them was wrong: it
+  said the remaining route was "a substantially larger piece of work", when BlackHole
+  *documents* renaming as a supported build-time customization. It is one `xcodebuild`.
+  **The GPL-3.0 gate is unresolved.** A renamed build is a derivative work: distributing it
+  obliges a source offer, and BlackHole's README asks distributors to contact Existential Audio.
+  Fine for local use; settle it before shipping.
 - **Confirm the chain UI by hand.** The engine below it is measured; the buttons are not. Worth
   one pass: add two or three effects, reorder with ↑/↓, toggle bypass while running (should be
   seamless — it is the one edit that does not cycle the engine), open two plugin windows at

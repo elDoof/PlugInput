@@ -26,7 +26,7 @@ enum SpikeMode: String {
 let arguments = Array(CommandLine.arguments.dropFirst())
 let mode = arguments.first.flatMap(SpikeMode.init(rawValue:)) ?? .mic
 let runSeconds = Double(arguments.dropFirst().first ?? "") ?? 120
-let virtualDeviceFragment = "BlackHole"
+let virtualDeviceFragment = ProcessInfo.processInfo.environment["SPIKE_VIRTUAL_DEVICE"] ?? "BlackHole"
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data("\nerror: \(message)\n".utf8))

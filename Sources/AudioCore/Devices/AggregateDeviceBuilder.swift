@@ -86,7 +86,7 @@ enum AggregateRegistry {
 ///
 /// `kAudioAggregateDeviceIsPrivateKey` keeps it out of the user's device list — it never
 /// shows up in Audio MIDI Setup or the menu bar. Its subdevices stay ordinary system
-/// devices, which is what should let other apps keep reading BlackHole while we drive it.
+/// devices, which is what should let other apps keep reading the loopback while we drive it.
 final class AggregateDevice {
     let id: AudioObjectID
     let uid: String

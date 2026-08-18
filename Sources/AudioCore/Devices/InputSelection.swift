@@ -9,8 +9,8 @@ import Foundation
 ///
 /// That is not hypothetical. `available` deliberately excludes the virtual device, because
 /// capturing from it would feed the processed signal back into itself. The *system default
-/// input* carries no such exclusion, and PlugInput exists to make other apps treat BlackHole
-/// as a microphone — so the moment one of them makes it the default, the plain
+/// input* carries no such exclusion, and PlugInput exists to make other apps treat its own
+/// loopback driver as a microphone — so the moment one makes it the default, the plain
 /// "saved ?? systemDefault" fallback resolves to the single device that cannot be used.
 ///
 /// Preference order: the user's saved choice, then the system default, then whatever is

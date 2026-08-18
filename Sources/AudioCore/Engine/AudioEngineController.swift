@@ -154,11 +154,11 @@ public final class AudioEngineController: @unchecked Sendable {
         stopOnQueue()
 
         let subDevices = Self.orderedSubDevices(input: input, virtual: virtual, monitor: monitor)
-        // Private. Publishing this aggregate under the name "PlugInput" so other apps could
-        // select it directly was tried and does not work — gotchas #17 and #19. Users select
-        // BlackHole.
+        // Private. Publishing this aggregate so other apps could select it directly was tried
+        // and does not work — gotchas #17 and #19. The name now comes from the HAL driver
+        // instead, which is what other apps select.
         let device = try AggregateDevice(
-            uid: VirtualMicrophone.deviceUID,
+            uid: VirtualMicrophone.aggregateUID,
             name: "PlugInput Engine",
             subDevices: subDevices,
             clockSourceUID: input.uid

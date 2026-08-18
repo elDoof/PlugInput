@@ -6,7 +6,7 @@ Run a compressor — or a de-esser, an EQ, a reverb — on your voice without op
 have Zoom, Discord, Slack, or OBS receive the processed signal as a microphone.
 
 ```
-mic → [Audio Unit effects] → private aggregate device → headphones + BlackHole 2ch
+mic → [Audio Unit effects] → private aggregate device → headphones + PlugInput
                                                                     ↑
                                           other apps select this as their microphone
 ```
@@ -14,11 +14,13 @@ mic → [Audio Unit effects] → private aggregate device → headphones + Black
 ## Requirements
 
 - macOS 14 or later
-- [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole) — `brew install blackhole-2ch`
 - Xcode command line tools (Swift 6)
 
-PlugInput does not ship an audio driver. BlackHole is what carries the processed signal to
-other applications, and it must be installed separately.
+PlugInput ships its own audio driver: `./make-driver.sh install` builds it and installs it to
+`/Library/Audio/Plug-Ins/HAL`, which needs an administrator password once. It is a renamed build
+of [BlackHole](https://github.com/ExistentialAudio/BlackHole) — that is what lets the device
+appear under our own name, since a CoreAudio device name is fixed at compile time. If you
+already run BlackHole, the two coexist: different name, bundle id, and UID.
 
 ## Build and run
 
@@ -41,7 +43,7 @@ To stop it: `killall PlugInput`, or Quit from the menu.
 3. Click the **Effect chain** row to open the window, and search the Audio Units you have
    installed (677 on the development machine). Click one to add it to the chain.
 4. Press **Start**.
-5. In Zoom / Discord / OBS, select **BlackHole 2ch** as the microphone.
+5. In Zoom / Discord / OBS, select **PlugInput** as the microphone.
 
 ### The chain
 
@@ -93,7 +95,7 @@ virtual device from a separate process — exactly as another app would:
 
 ```bash
 cd Spike && swift build
-./.build/debug/PlugInputSpike listen 4 BlackHole
+./.build/debug/PlugInputSpike listen 4 PlugInput
 ```
 
 Broadband well above −120.0 dBFS means signal is arriving. Ignore the harness's `RESULT: FAIL`
@@ -102,10 +104,13 @@ number.
 
 ## Known limitations
 
-- **Other apps see "BlackHole 2ch", not "PlugInput".** Presenting a device under our own name
-  is not achievable with CoreAudio aggregates — two approaches were built and measured, and
-  both fail. See gotchas #17 and #19 in [CLAUDE.md](CLAUDE.md). Doing it properly means shipping
-  a real CoreAudio HAL driver.
+- **The driver must be installed separately, with sudo.** Other apps see "PlugInput" only
+  after `./make-driver.sh install`. Presenting a device under our own name is not achievable
+  with CoreAudio aggregates — two approaches were built and measured, and both failed (gotchas
+  #17 and #19 in [CLAUDE.md](CLAUDE.md)), so the name comes from a real HAL driver instead.
+- **The driver is GPL-3.0.** It is a renamed build of BlackHole, so redistributing PlugInput
+  with it attached carries a source-offer obligation, and BlackHole's authors ask distributors
+  to contact them. Unresolved; it does not affect local use.
 - **Eight effects maximum.** Each one is loaded in-process and adds latency; the window shows
   the running total, and warns above ~5 ms because that is where talking over it gets hard.
 - **Plugins load in-process.** `.loadOutOfProcess` is AUv3-only and most installed Audio Units
@@ -137,9 +142,10 @@ the CoreAudio and `AVAudioEngine` binding code is not meaningfully unit-testable
 by the Phase 0 spike's two-process tone test instead, so the parts that *are* testable need
 somewhere to live that SwiftUI cannot reach into.
 
-The private aggregate device is load-bearing. Binding an output engine straight at BlackHole
-renders audio but delivers nothing, and the input channel map is what stops BlackHole's own
-input channels — which carry whatever was just written to it — from closing a feedback loop.
+The private aggregate device is load-bearing. Binding an output engine straight at the
+loopback renders audio but delivers nothing, and the input channel map is what stops the
+loopback's own input channels — which carry whatever was just written to it — from closing a
+feedback loop.
 
 **[CLAUDE.md](CLAUDE.md) is the engineering companion to this file**: the decisions that are
 settled, and twenty-one gotchas that each cost real debugging time. Every one of them fails

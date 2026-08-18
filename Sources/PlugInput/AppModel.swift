@@ -47,9 +47,14 @@ final class AppModel {
     private(set) var inputPeak: Float = 0
     private(set) var opensAtLogin = LoginItem.isEnabled
 
-    /// What other apps see in their microphone list. Named for the app rather than for
-    /// BlackHole, which is the driver underneath and means nothing to the person choosing it.
+    /// What other apps see in their microphone list. The name is the HAL driver's own, so it
+    /// reads as "PlugInput" rather than as someone else's driver.
     let virtualMicrophoneName = VirtualMicrophone.deviceName
+
+    /// Said in two places — when a scan finds no loopback, and when a start is refused for the
+    /// same reason — and compared against in order to clear itself, so it lives in one place.
+    private static let driverMissingStatus =
+        "PlugInput audio driver not found — install it with ./make-driver.sh"
 
     private let engine = AudioEngineController()
     private let store: SessionStore?
@@ -172,7 +177,7 @@ final class AppModel {
         monitorDevice = environment.monitor
         inputDevices = environment.inputs
 
-        // Resolved rather than defaulted: the system default input is regularly BlackHole
+        // Resolved rather than defaulted: the system default input is regularly the loopback
         // itself, because pointing other apps at it is what this app is for. That UID is
         // excluded from `inputs` on purpose, and naming it here made `start()` refuse with
         // "No input device selected" and capture nothing.
@@ -183,8 +188,8 @@ final class AppModel {
         )
 
         if virtualDevice == nil {
-            status = "BlackHole not found — install it with: brew install blackhole-2ch"
-        } else if status.hasPrefix("BlackHole not found") {
+            status = Self.driverMissingStatus
+        } else if status == Self.driverMissingStatus {
             status = ""
         }
     }
@@ -363,7 +368,7 @@ final class AppModel {
             return
         }
         guard let virtualDevice else {
-            status = "BlackHole not found — install it with: brew install blackhole-2ch"
+            status = Self.driverMissingStatus
             return
         }
         guard let monitorDevice else {
@@ -375,7 +380,7 @@ final class AppModel {
         // aggregate went public, and it is easy to hit by accident: "PlugInput" now appears in
         // the system's output list too.
         guard monitorDevice.uid != virtualDevice.uid,
-              monitorDevice.uid != VirtualMicrophone.deviceUID
+              monitorDevice.uid != VirtualMicrophone.aggregateUID
         else {
             let reason = "System output is set to \(monitorDevice.name). "
                 + "Switch it to your speakers or headphones."

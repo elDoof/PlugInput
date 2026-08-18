@@ -76,7 +76,7 @@ struct ConsoleView: View {
 /// Mic → effect → outputs, drawn as the chain it actually is.
 ///
 /// Worth showing because the interesting failures are routing failures: the wrong input
-/// selected, BlackHole missing, or the system output pointed at BlackHole so the app refuses to
+/// selected, the PlugInput driver missing, or the system output pointed at it so the app refuses to
 /// start. Seeing the chain makes those obvious instead of mysterious.
 private struct SignalChainView: View {
     let model: AppModel
@@ -94,7 +94,7 @@ private struct SignalChainView: View {
                 stage(effectsLabel, systemImage: "slider.horizontal.3")
                 arrow
                 VStack(alignment: .leading, spacing: 4) {
-                    stage(model.virtualDevice?.name ?? "BlackHole missing", systemImage: "waveform")
+                    stage(model.virtualDevice?.name ?? "PlugInput driver missing", systemImage: "waveform")
                     stage(monitorLabel, systemImage: model.isMonitorEnabled ? "headphones" : "speaker.slash")
                         .opacity(model.isMonitorEnabled ? 1 : 0.5)
                 }
