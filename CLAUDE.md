@@ -6,11 +6,16 @@ OBS see the processed signal as a microphone.
 
 ## Status: working and in daily use
 
-Last verified 2026-08-15: **mic → AnalogObsession LALA → private aggregate → BlackHole**,
-measured from a separate process at **−34.0 dBFS broadband** against a −120.0 dBFS silence
+Last verified 2026-08-16: **mic → LALA → Pro-L 2 → LALA → private aggregate → BlackHole**,
+measured from a separate process at **−17.8 dBFS broadband** against a −120.0 dBFS silence
 control. Also verified: 63/63 tests, `PlugInput.app` launches and stays resident, 677 AU
-effects discovered, no orphaned aggregates, plugin switching survives an engine restart, the
-monitor toggle mutes only the monitor leg, and session persistence against a real Audio Unit.
+effects discovered, no orphaned aggregates, a three-plugin chain wires in the logged order
+(duplicates included), a pre-chain `session.json` migrates with its state intact, the monitor
+toggle mutes only the monitor leg, and the exception barrier catches a real double-tap raise.
+
+**Not verified from here:** the click-level chain UI — adding, reordering with ↑/↓, toggling
+bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
+Ask the user rather than assuming, and see "Working on this".
 
 Reproduce it with the app running and a plugin loaded:
 
@@ -33,19 +38,24 @@ out. `README.md` is the human-facing doc — what the app is, how to run it, kno
 
 ### What the last session changed
 
-Four user-visible fixes, all verified rather than assumed:
+Two features, in this order — the first exists to make the second safe:
 
-- **Crash on plugin switch** — a leaked input tap (gotcha #14).
-- **Silent microphone** — two independent causes: the input resolver could pick BlackHole
-  (gotcha #15), and ad-hoc signing dropped the TCC grant every rebuild (gotcha #13).
-- **Intermittent UI freeze** — `OSLogStore` and CoreAudio queries on the main actor
-  (gotcha #18).
-- **Monitor on/off checkbox** — mutes the monitor leg of the output channel map without
-  touching what other apps receive.
+- **An Objective-C exception barrier around graph mutation** (gotcha #21). `installTap`,
+  `attach`, `connect`, `detach`, `prepare` and `mainMixerNode` *raise* rather than throw, and an
+  `NSException` unwinds past every Swift `do/catch` and aborts the process. `withGraphBarrier`
+  converts the family into caught errors that flow into the existing failure path.
+- **An ordered effect chain of up to 8 plugins**, each with its own settings and bypass,
+  reorderable from the console window. `PluginChain` is an immutable value; slots carry a UUID
+  so the same plugin can appear twice and a reorder carries settings and windows with it.
 
-And one deliberate non-delivery: naming the virtual mic "PlugInput" (gotchas #17, #19). Both
-aggregate routes were built, measured, and reverted. Do not start a third attempt without
-reading those two entries — the remaining route is a real HAL driver.
+Two standing non-deliveries, both deliberate:
+
+- **Naming the virtual mic "PlugInput"** (gotchas #17, #19). Both aggregate routes were built,
+  measured, and reverted. Do not start a third attempt without reading those entries — the
+  remaining route is a real HAL driver.
+- **A live graph differ.** The chain rebuilds the engine on every add/remove/reorder, because
+  rewiring a running `AVAudioEngine` is the fragility gotcha #14 came out of. A dropout per edit
+  is the accepted cost. Bypass is the exception: it is a live property, so it is seamless.
 
 ## Build and run
 
@@ -314,10 +324,18 @@ whether the engine actually started. Delete it to reset the app.
   itself is) under our own name, which is a substantially larger piece of work and would mean
   the app installs a system driver. Until then, users select BlackHole, and
   `VirtualMicrophone` holds only the naming constants plus the write-up of why.
-- **Remaining UI polish:** monitor/output device pickers, and a latency badge. The searchable
-  browser, dB meter, signal chain, monitor toggle, and activity log are done.
+- **Confirm the chain UI by hand.** The engine below it is measured; the buttons are not. Worth
+  one pass: add two or three effects, reorder with ↑/↓, toggle bypass while running (should be
+  seamless — it is the one edit that does not cycle the engine), open two plugin windows at
+  once, remove one. `chain: added` / `chain: removed` / `chain: reordered to …` lines in the log
+  are the readout.
+- **Chain presets.** The chain is already one `Codable` value, so saving named chains is close to
+  free: a directory of `PluginChain` JSON beside `session.json`, and a picker. The invariant that
+  each slot's state travels with its own plugin is what makes a preset portable.
+- **Remaining UI polish:** monitor/output device pickers. The searchable browser, dB meter,
+  routing summary, chain editor, latency badge, monitor toggle, and activity log are done.
 
-Presets, persistence, and the login item are built — see "Persistence" above.
+Persistence and the login item are built — see "Persistence" above.
 
 ## Working on this
 
@@ -326,19 +344,27 @@ Verify, do not assume. Every layer of this app reports success while producing s
 here in a way that cost hours. The check that settles it is the two-process listener in
 `Spike/`, because it stands outside the app entirely.
 
-Three failures from the last session, as calibration:
+Four failures from earlier sessions, as calibration:
 
 - A channel-map write returned `noErr` **and read back correctly** and still killed the start
   (#19).
 - A device was created with the right channel counts and carried exact digital silence (#17).
 - A tap was removed on every path that looked like it mattered, and leaked on the one that
   did (#14).
+- A plugin GUI reopened cleanly and was wired to a unit the engine had already detached — the
+  reason plugin windows are keyed by slot id rather than by unit or index.
 
 The app cannot be clicked from a terminal session, so when a question needs a human — "does
-switching plugins still work?" — ask rather than infer. `session.json` can be edited directly
-to drive a restart-and-observe loop without clicking, which is how the monitor toggle was
-verified in both positions; note that a running app rewrites that file on its 30-second
-autosave, so kill it before editing.
+reordering the chain still work?" — ask rather than infer, and do not report a click-level path
+as verified. `session.json` can be edited directly to drive a restart-and-observe loop without
+clicking: that is how the monitor toggle was verified in both positions, and how a three-plugin
+chain was verified end to end. Note that a running app rewrites that file on its 30-second
+autosave, so quit it before editing — and back the file up first, since it holds the user's real
+setup.
+
+Quit with `osascript -e 'quit app "PlugInput"'` rather than `killall` when testing teardown.
+`killall` skips `willTerminate`, so it neither destroys the aggregate (gotcha #7) nor exercises
+the path that matters (gotcha #20).
 
 ## Conventions
 
