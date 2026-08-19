@@ -53,8 +53,12 @@ final class AppModel {
 
     /// Said in two places — when a scan finds no loopback, and when a start is refused for the
     /// same reason — and compared against in order to clear itself, so it lives in one place.
+    ///
+    /// Phrased for someone who installed a `.pkg` and has no repository checkout. It used to
+    /// read "install it with ./make-driver.sh", which is a build instruction: correct for the
+    /// one machine this was written on and meaningless to everybody else.
     private static let driverMissingStatus =
-        "PlugInput audio driver not found — install it with ./make-driver.sh"
+        "PlugInput audio driver not found — reinstall PlugInput to restore it"
 
     private let engine = AudioEngineController()
     private let store: SessionStore?
