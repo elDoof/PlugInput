@@ -333,6 +333,11 @@ whether the engine actually started. Delete it to reset the app.
 
 ## Next steps
 
+- **Public release is planned and scoped in [RELEASE.md](RELEASE.md).** Decisions already
+  taken there: direct distribution with a notarized `.pkg`, the driver bundled under
+  GPL-3.0 compliance, and therefore **no Mac App Store**. Read it before touching signing,
+  packaging, or the driver's licensing.
+
 - **Naming the mic "PlugInput" is DONE — via a driver, not an aggregate.** `make-driver.sh`
   builds a renamed BlackHole (`kDriver_Name` / `kDevice_Name`, pinned to v0.6.1) and installs it
   to `/Library/Audio/Plug-Ins/HAL`. Other apps now select **PlugInput**. The aggregate routes
