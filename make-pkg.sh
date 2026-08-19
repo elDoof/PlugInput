@@ -98,11 +98,28 @@ chmod +x "$OUT/scripts/postinstall"
 # --- component packages ---------------------------------------------------------------------
 
 echo "==> pkgbuild"
+
+# Bundle relocation has to be switched off explicitly, and it is not optional.
+#
+# By default macOS Installer looks for an existing bundle with the same CFBundleIdentifier
+# anywhere on the disk and installs *there* instead of at the path in the payload. On a machine
+# that has ever had a copy of PlugInput — a developer checkout, an old build in ~/Downloads —
+# the app silently lands on top of that copy and never appears in /Applications, while the
+# receipt still claims it did. Observed exactly that:
+#
+#   PackageKit: Applications/PlugInput.app relocated to Users/.../Desktop/Apps/PlugInput.app
+#
+# `pkgbuild --analyze` writes a component plist describing each bundle it found; setting
+# BundleIsRelocatable to false in it pins the install to the payload path.
+pkgbuild --analyze --root "$OUT/root-app" "$OUT/app-components.plist" > /dev/null
+plutil -replace 0.BundleIsRelocatable -bool NO "$OUT/app-components.plist"
+
 pkgbuild --quiet \
     --root "$OUT/root-app" \
     --identifier "com.pluginput.app" \
     --version "$VERSION" \
     --install-location / \
+    --component-plist "$OUT/app-components.plist" \
     "$OUT/PlugInput-app.pkg"
 
 pkgbuild --quiet \
