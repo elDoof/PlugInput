@@ -50,16 +50,56 @@ fi
 
 # --- the app --------------------------------------------------------------------------------
 
+# Removing an installed .app takes more than root on macOS 14 and later.
+#
+# App Management protection refuses to let one program delete another's installed bundle, and
+# it outranks sudo: `sudo rm -rf` on a package-installed PlugInput.app fails with "Operation
+# not permitted", with no prompt and no way for the script to elevate past it. Finder holds
+# the entitlement, so the removal is delegated to Finder, which also puts the bundle in the
+# Trash rather than destroying it — a user who runs this by mistake can put it back.
+#
+# The direct removal is kept as a fallback for the cases Finder cannot serve: an ssh session
+# with no GUI, or a bundle that was merely copied into place and so is not protected.
+remove_app_bundle() {
+    local path="$1"
+
+    if osascript -e "tell application \"Finder\" to delete POSIX file \"$path\"" > /dev/null 2>&1 \
+       && [[ ! -d "$path" ]]; then
+        echo "    moved to the Trash"
+        return 0
+    fi
+
+    if rm -rf "$path" 2>/dev/null && [[ ! -d "$path" ]]; then
+        echo "    removed"
+        return 0
+    fi
+    if sudo rm -rf "$path" 2>/dev/null && [[ ! -d "$path" ]]; then
+        echo "    removed"
+        return 0
+    fi
+
+    return 1
+}
+
 APP_REMOVED=false
+APP_FAILED=false
 for candidate in "/Applications/$APP_NAME.app" "$HOME/Applications/$APP_NAME.app"; do
     if [[ -d "$candidate" ]]; then
         echo "==> removing $candidate"
-        rm -rf "$candidate" 2>/dev/null \
-            || sudo rm -rf "$candidate"
-        APP_REMOVED=true
+        if remove_app_bundle "$candidate"; then
+            APP_REMOVED=true
+        else
+            APP_FAILED=true
+            echo "!!! Could not remove $candidate." >&2
+            echo "    macOS App Management protection blocks this, and sudo does not help." >&2
+            echo "    Either drag the app to the Trash in Finder, or grant your terminal" >&2
+            echo "    App Management permission in System Settings > Privacy & Security." >&2
+        fi
     fi
 done
-$APP_REMOVED || echo "==> no installed app found (skipping)"
+if ! $APP_REMOVED && ! $APP_FAILED; then
+    echo "==> no installed app found (skipping)"
+fi
 
 # --- the driver -----------------------------------------------------------------------------
 
@@ -76,6 +116,20 @@ if [[ -d "$DRIVER" ]]; then
 else
     echo "==> no driver installed at $DRIVER (skipping)"
 fi
+
+# --- receipts -------------------------------------------------------------------------------
+
+# Payload removal does not clear the installer receipt. Leaving it means `pkgutil --pkgs` keeps
+# reporting PlugInput as installed, and a reinstall of the same version can be treated as
+# already satisfied. Failure here is not fatal: the files are already gone, which is what the
+# user asked for.
+for receipt in com.pluginput.app com.pluginput.driver; do
+    if pkgutil --pkg-info "$receipt" > /dev/null 2>&1; then
+        echo "==> forgetting receipt $receipt"
+        sudo pkgutil --forget "$receipt" > /dev/null 2>&1 \
+            || echo "    could not forget $receipt (harmless)"
+    fi
+done
 
 # --- settings -------------------------------------------------------------------------------
 
@@ -94,6 +148,9 @@ fi
 # report success and change nothing.
 echo
 FAILED=false
+if $APP_FAILED; then
+    FAILED=true
+fi
 if [[ -d "$DRIVER" ]]; then
     echo "!!! $DRIVER is still present" >&2
     FAILED=true
