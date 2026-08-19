@@ -67,7 +67,11 @@ git -C "$SRC" checkout --quiet "$SOURCE_TAG"
 # Same reasoning as make-app.sh: a stable leaf keeps the code requirement stable. A HAL driver
 # needs no TCC grant, so ad-hoc is a genuine fallback here rather than a trap — a self-signed,
 # un-notarized driver does load, which this project verified rather than assumed.
-if security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
+# Captured rather than piped: `security ... | grep -q` reports failure under `set -o pipefail`
+# when grep exits first and `security` takes a SIGPIPE, which would silently sign the driver
+# ad-hoc despite the identity being present.
+IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+if grep -q "$SIGN_IDENTITY" <<< "$IDENTITIES"; then
     SIGN_ARGS=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$SIGN_IDENTITY" DEVELOPMENT_TEAM="")
     echo "==> signing with '$SIGN_IDENTITY'"
 else
@@ -89,6 +93,7 @@ rm -rf "$OUT"
         CONFIGURATION_BUILD_DIR="$OUT" \
         PRODUCT_NAME="$DRIVER_NAME" \
         PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+        ENABLE_HARDENED_RUNTIME=YES \
         "${SIGN_ARGS[@]}" \
         GCC_PREPROCESSOR_DEFINITIONS='$GCC_PREPROCESSOR_DEFINITIONS kDriver_Name=\"'"$DRIVER_NAME"'\" kPlugIn_BundleID=\"'"$BUNDLE_ID"'\" kDevice_Name=\"'"$DEVICE_NAME"'\"' \
         build > "$ROOT/.build/driver-build.log" 2>&1 \
@@ -98,6 +103,19 @@ rm -rf "$OUT"
 readonly BUNDLE="$OUT/$DRIVER_NAME.driver"
 [[ -d "$BUNDLE" ]] || { echo "expected $BUNDLE to exist" >&2; exit 1; }
 echo "    built $BUNDLE"
+
+# The hardened runtime is required for notarization, on the driver as much as on the app —
+# every publicly distributed HAL driver on this machine carries it (stock BlackHole and Zoom's
+# both read flags=0x10000(runtime), both notarized under a Developer ID). ENABLE_HARDENED_RUNTIME
+# above asks for it; this confirms xcodebuild honoured it, because a missing flag is invisible
+# until Apple rejects the upload at the very end of the release process.
+DRIVER_SIGNATURE="$(codesign -d --verbose=2 "$BUNDLE" 2>&1 || true)"
+if grep -q "flags=.*runtime" <<< "$DRIVER_SIGNATURE"; then
+    echo "    hardened runtime: yes"
+else
+    echo "!!! $BUNDLE is not signed with the hardened runtime; notarization would reject it" >&2
+    exit 1
+fi
 
 if [[ "$MODE" == "build" ]]; then
     echo "==> done (not installed)"
@@ -117,7 +135,12 @@ sudo killall -9 coreaudiod
 echo "==> waiting for coreaudiod"
 sleep 3
 
-if system_profiler SPAudioDataType 2>/dev/null | grep -q "^ *$DEVICE_NAME:"; then
+# Captured, not piped — and here it matters more than anywhere else in this file.
+# `system_profiler` emits a lot of output, so `grep -q` reliably exits before it finishes and
+# kills it with SIGPIPE; under `set -o pipefail` that makes a successful install report
+# "did not appear" and exit 1.
+AUDIO_DEVICES="$(system_profiler SPAudioDataType 2>/dev/null || true)"
+if grep -q "^ *$DEVICE_NAME:" <<< "$AUDIO_DEVICES"; then
     echo "==> '$DEVICE_NAME' is present as an audio device"
 else
     echo "!!! '$DEVICE_NAME' did not appear. Check .build/driver-build.log" >&2

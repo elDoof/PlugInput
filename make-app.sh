@@ -13,6 +13,14 @@ CONFIG=${1:-release}
 APP="PlugInput.app"
 BUNDLE_ID="com.pluginput.app"
 
+# One source of truth for the version, shared with make-pkg.sh. The marketing version lives in
+# ./VERSION; the build number is the git commit count, which rises monotonically and needs no
+# bookkeeping. Both are required to be sane by the installer: macOS will refuse to "upgrade" to
+# a package whose CFBundleVersion is not greater than the installed one.
+VERSION="$(tr -d '[:space:]' < VERSION)"
+BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+echo "==> Version $VERSION (build $BUILD)"
+
 echo "==> Building ($CONFIG)"
 swift build -c "$CONFIG"
 BINARY="$(swift build -c "$CONFIG" --show-bin-path)/PlugInput"
@@ -32,8 +40,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>PlugInput</string>
     <key>CFBundleDisplayName</key><string>PlugInput</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundleVersion</key><string>$BUILD</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <!-- Menu bar only: no dock icon, no main window. -->
     <key>LSUIElement</key><true/>
@@ -80,18 +88,47 @@ PLIST
 #     -name "PlugInput Local Signing" -macalg sha1 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
 #   security import id.p12 -k ~/Library/Keychains/login.keychain-db -P PASSWORD -T /usr/bin/codesign
 #
-# For distribution, swap in a Developer ID identity and add --options runtime.
-SIGN_IDENTITY="PlugInput Local Signing"
+# Identity selection, in priority order:
+#   1. $PLUGINPUT_SIGN_IDENTITY, so a release build can name an identity explicitly
+#   2. a "Developer ID Application" identity, if the machine has one — the distribution
+#      identity, and using it locally means the build that gets notarized is the build
+#      that was actually tested
+#   3. the self-signed local leaf described above
+#   4. ad-hoc, which re-prompts for the microphone on every rebuild
+SIGN_AS="${PLUGINPUT_SIGN_IDENTITY:-}"
 
-if security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
-    echo "==> Signing ($SIGN_IDENTITY)"
-    SIGN_AS="$SIGN_IDENTITY"
-else
+# Read the identity list once into a variable. Piping it straight into `grep -q` is unsafe
+# under `set -o pipefail`: grep exits on the first match, `security` dies of SIGPIPE, and the
+# pipeline reports failure despite the match — which here would silently drop the build to
+# ad-hoc signing, and ad-hoc signing means a microphone re-prompt and silent capture until it
+# is answered.
+IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+
+if [[ -z "$SIGN_AS" ]]; then
+    SIGN_AS="$(sed -n 's/.*"\(Developer ID Application:.*\)"$/\1/p' <<< "$IDENTITIES" | head -1)"
+fi
+if [[ -z "$SIGN_AS" ]] && grep -q "PlugInput Local Signing" <<< "$IDENTITIES"; then
+    SIGN_AS="PlugInput Local Signing"
+fi
+if [[ -z "$SIGN_AS" ]]; then
     echo "==> Signing (ad-hoc — expect a microphone prompt after every rebuild)"
     SIGN_AS="-"
+else
+    echo "==> Signing ($SIGN_AS)"
 fi
 
-codesign --force --sign "$SIGN_AS" --entitlements "$ENTITLEMENTS" "$APP" 2>&1 | sed 's/^/    /'
+# --options runtime is ALWAYS on, not only for release builds.
+#
+# Notarization rejects a bundle without the hardened runtime, but the reason to enable it here
+# rather than in a separate release path is that the hardened runtime is enforced by the
+# *kernel* regardless of which certificate signed the bundle. A locally-signed build with it on
+# therefore exercises exactly the restrictions a notarized build will face, which is the only
+# way to find out before shipping that it does not stop third-party Audio Units from loading.
+# (It does not, because disable-library-validation is in the entitlements above — but this
+# project's whole history is layers reporting success while producing silence, so it is
+# measured, not assumed. See RELEASE.md.)
+codesign --force --sign "$SIGN_AS" --options runtime \
+    --entitlements "$ENTITLEMENTS" "$APP" 2>&1 | sed 's/^/    /'
 rm -f "$ENTITLEMENTS"
 
 echo
