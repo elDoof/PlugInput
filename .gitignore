@@ -7,7 +7,7 @@ PlugInput.app/
 
 .DS_Store
 
-# Editor and assistant scratch config, machine-local.
+# Machine-local editor and tooling config.
 .claude/
 CLAUDE.md
 

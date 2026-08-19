@@ -16,7 +16,7 @@ toggle mutes only the monitor leg, and the exception barrier catches a real doub
 
 **Not verified from here:** the click-level chain UI — adding, reordering with ↑/↓, toggling
 bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
-Ask the user rather than assuming, and see "Working on this".
+That pass is still worth doing; see "Working on the audio path".
 
 Reproduce it with the app running and a plugin loaded:
 
@@ -31,13 +31,12 @@ looks exactly like a real failure.
 
 ### Version control
 
-The project is a git repo, pushed to **`github.com/elDoof/PlugInput` (private)**, single branch
-`main`. `.gitignore` keeps `.build/` (~650M), `PlugInput.app/`, and `.claude/settings.local.json`
-out. `README.md` is the human-facing doc — what the app is, how to run it, known limitations.
-**This file is the engineering companion to it**; keep the overlap thin and let README describe
-*use* while this describes *why*.
+Single branch `main`. `.gitignore` keeps `.build/` (~650M), `PlugInput.app/`, and built
+installers out. `README.md` is the user-facing doc: what the app is, how to install it, known
+limitations. **This file is the engineering companion to it**; keep the overlap thin and let
+README describe *use* while this describes *why*.
 
-### What the last session changed
+### Recent changes
 
 Two features, in this order — the first exists to make the second safe:
 
@@ -115,9 +114,9 @@ and installs via `make-driver.sh` (gotcha #22). BlackHole is still installed on 
 alongside it, and other software still points at it; the two coexist because the driver carries
 its own name, bundle id, and UID.
 
-## Decisions already made — do not relitigate
+## Settled decisions
 
-- **Audio Units, not VST3.** The user asked for VST originally. This machine has 710 AU
+- **Audio Units, not VST3.** VST3 was the starting assumption. This machine has 710 AU
   components vs 366 VST3 bundles, and *every* vendor in the library ships both (iZotope's AU
   bundles are just named `iZOzone12AUHook.component`, which is what made the VST3 list look
   exclusive). AU hosting is native `AVAudioEngine`, gets real plugin GUIs free via
@@ -360,14 +359,14 @@ whether the engine actually started. Delete it to reset the app.
 
 Persistence and the login item are built — see "Persistence" above.
 
-## Working on this
+## Working on the audio path
 
 Verify, do not assume. Every layer of this app reports success while producing silence, so
 "it compiles", "the write returned `noErr`", and "the device was created" have each been wrong
 here in a way that cost hours. The check that settles it is the two-process listener in
 `Spike/`, because it stands outside the app entirely.
 
-Four failures from earlier sessions, as calibration:
+Four failures from this project's history, as calibration:
 
 - A channel-map write returned `noErr` **and read back correctly** and still killed the start
   (#19).
@@ -377,13 +376,12 @@ Four failures from earlier sessions, as calibration:
 - A plugin GUI reopened cleanly and was wired to a unit the engine had already detached — the
   reason plugin windows are keyed by slot id rather than by unit or index.
 
-The app cannot be clicked from a terminal session, so when a question needs a human — "does
-reordering the chain still work?" — ask rather than infer, and do not report a click-level path
-as verified. `session.json` can be edited directly to drive a restart-and-observe loop without
-clicking: that is how the monitor toggle was verified in both positions, and how a three-plugin
-chain was verified end to end. Note that a running app rewrites that file on its 30-second
-autosave, so quit it before editing — and back the file up first, since it holds the user's real
-setup.
+UI paths have to be exercised by hand, and a click-level path nobody has clicked should not
+be recorded as verified. Where a case can be reached without the mouse, `session.json` can be
+edited directly to drive a restart-and-observe loop: that is how the monitor toggle was checked
+in both positions, and how a three-plugin chain was checked end to end. A running app rewrites
+that file on its 30-second autosave, so quit it before editing, and back it up first since it
+holds a real setup.
 
 Quit with `osascript -e 'quit app "PlugInput"'` rather than `killall` when testing teardown.
 `killall` skips `willTerminate`, so it neither destroys the aggregate (gotcha #7) nor exercises
