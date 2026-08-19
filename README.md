@@ -107,7 +107,7 @@ number.
 - **The driver must be installed separately, with sudo.** Other apps see "PlugInput" only
   after `./make-driver.sh install`. Presenting a device under our own name is not achievable
   with CoreAudio aggregates — two approaches were built and measured, and both failed (gotchas
-  #17 and #19 in [CLAUDE.md](CLAUDE.md)), so the name comes from a real HAL driver instead.
+  #17 and #19 in [ENGINEERING.md](ENGINEERING.md)), so the name comes from a real HAL driver instead.
 - **The driver is GPL-3.0.** It is a renamed build of BlackHole, so redistributing PlugInput
   with it attached carries a source-offer obligation, and BlackHole's authors ask distributors
   to contact them. Unresolved; it does not affect local use.
@@ -147,7 +147,7 @@ loopback renders audio but delivers nothing, and the input channel map is what s
 loopback's own input channels — which carry whatever was just written to it — from closing a
 feedback loop.
 
-**[CLAUDE.md](CLAUDE.md) is the engineering companion to this file**: the decisions that are
+**[ENGINEERING.md](ENGINEERING.md) is the engineering companion to this file**: the decisions that are
 settled, and twenty-one gotchas that each cost real debugging time. Every one of them fails
 silently. Read it before changing the device or channel-map code.
 

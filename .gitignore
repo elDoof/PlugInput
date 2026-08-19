@@ -7,8 +7,9 @@ PlugInput.app/
 
 .DS_Store
 
-# Personal, machine-local Claude Code settings.
-.claude/settings.local.json
+# Editor and assistant scratch config, machine-local.
+.claude/
+CLAUDE.md
 
 # Built installers — regenerate with ./make-pkg.sh
 PlugInput-*.pkg
