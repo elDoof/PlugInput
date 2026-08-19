@@ -9,3 +9,6 @@ PlugInput.app/
 
 # Personal, machine-local Claude Code settings.
 .claude/settings.local.json
+
+# Built installers — regenerate with ./make-pkg.sh
+PlugInput-*.pkg
