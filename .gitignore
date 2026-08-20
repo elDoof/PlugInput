@@ -7,9 +7,5 @@ PlugInput.app/
 
 .DS_Store
 
-# Machine-local editor and tooling config.
-.claude/
-CLAUDE.md
-
 # Built installers — regenerate with ./make-pkg.sh
 PlugInput-*.pkg

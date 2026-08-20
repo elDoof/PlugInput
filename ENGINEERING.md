@@ -6,13 +6,14 @@ OBS see the processed signal as a microphone.
 
 ## Status: working and in daily use
 
-Last verified 2026-08-18: **mic → Pro-L 2 → private aggregate → PlugInput**, measured from a
-separate process at **−33.4 dBFS broadband** against a −120.0 dBFS silence control, with the
-app's own log line reading `virtual PlugInput`. The renamed HAL driver was measured separately
-at **−14.0 dBFS bit-exact** on the two-process tone test (gotcha #22). Also verified: 63/63 tests, `PlugInput.app` launches and stays resident, 677 AU
-effects discovered, no orphaned aggregates, a three-plugin chain wires in the logged order
-(duplicates included), a pre-chain `session.json` migrates with its state intact, the monitor
-toggle mutes only the monitor leg, and the exception barrier catches a real double-tap raise.
+The routing is measured, not assumed: **mic → effect chain → private aggregate → PlugInput**,
+read from a separate process at **−33.4 dBFS broadband** against a −120.0 dBFS silence control,
+with the app's own log line reading `virtual PlugInput`. The renamed HAL driver measures
+**−14.0 dBFS bit-exact** on the two-process tone test (gotcha #22). Also verified: the unit
+tests, `PlugInput.app` launching and staying resident, several hundred AU effects discovered, no
+orphaned aggregates, a three-plugin chain wiring in the logged order (duplicates included), a
+pre-chain `session.json` migrating with its state intact, the monitor toggle affecting only the
+monitor leg, and the exception barrier catching a real double-tap raise.
 
 **Not verified from here:** the click-level chain UI — adding, reordering with ↑/↓, toggling
 bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
@@ -104,22 +105,22 @@ Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindo
                          LoginItem
   Views/       ConsoleView (window: routing, meter, activity), ChainEditorView (reorder,
                bypass, remove), PluginBrowserView (search, adds to the chain)
-Tests/AudioCoreTests/    63 tests
+Tests/AudioCoreTests/    71 tests
 Spike/                 Phase 0 verification harness — separate package, kept as reference
 ```
 
 Signal path: **mic → [effect chain] → private aggregate device → headphones + PlugInput**.
 Other apps select **PlugInput** as their microphone — a CoreAudio HAL driver this project builds
-and installs via `make-driver.sh` (gotcha #22). BlackHole is still installed on this machine
-alongside it, and other software still points at it; the two coexist because the driver carries
-its own name, bundle id, and UID.
+and installs via `make-driver.sh` (gotcha #22). An existing BlackHole installation keeps
+working alongside it — verified — because the driver carries its own name, bundle id, and UID.
 
 ## Settled decisions
 
-- **Audio Units, not VST3.** VST3 was the starting assumption. This machine has 710 AU
-  components vs 366 VST3 bundles, and *every* vendor in the library ships both (iZotope's AU
-  bundles are just named `iZOzone12AUHook.component`, which is what made the VST3 list look
-  exclusive). AU hosting is native `AVAudioEngine`, gets real plugin GUIs free via
+- **Audio Units, not VST3.** VST3 was the starting assumption, and surveying a well-stocked
+  library overturned it: there were roughly twice as many AU components as VST3 bundles, and
+  *every* vendor shipped both (iZotope's AU bundles are named things like
+  `iZOzone12AUHook.component`, which is what made the VST3 list look exclusive). AU hosting is
+  native `AVAudioEngine`, gets real plugin GUIs free via
   `requestViewController`, and avoids JUCE and its GPL/commercial licensing question entirely.
 - **Both monitoring and virtual mic**, not one or the other.
 - **Menu bar utility** (`MenuBarExtra`), not a windowed app.
@@ -168,14 +169,15 @@ silence rather than an error.
    `system_profiler SPAudioDataType | grep -i pluginput`.
 8. Plugins load **in-process** — `.loadOutOfProcess` is AUv3-only and most of this library is
    AUv2, so a crashing plugin takes the app down. Deliberate compatibility tradeoff.
-9. Buffer floor on the aggregate is 15 frames; 128 ≈ 2.7 ms. Latency is not a concern.
-10. **The input tap must not capture `self`.** `AudioEngineController` is `@MainActor`, and
-    AVFAudio calls the tap on `RealtimeMessenger.mServiceQueue`. Touching main-actor state
+9. Buffer floor on the aggregate is 15 frames; 128 ≈ 2.7 ms. Latency is not a concern — which
+   is why the app no longer *asks* for a buffer size at all. See gotcha #24.
+10. **The input tap must not capture main-actor state.** AVFAudio calls the tap on
+    `RealtimeMessenger.mServiceQueue`. Touching main-actor state
     from there trips Swift's executor check and kills the process with `EXC_BREAKPOINT` on the
     **first audio buffer** — so the app dies the instant audio starts moving, not at launch,
     which is how it survived every build-and-launch check. `PeakLevel` exists to be the only
-    thing that closure captures. This one was found the hard way; see the crash report at
-    `~/Library/Logs/DiagnosticReports/PlugInput-2026-08-14-085048.ips`.
+    thing that closure captures. Found the hard way, from a crash report in
+    `~/Library/Logs/DiagnosticReports/`.
 11. **A microphone macOS has not authorized returns silence, not an error.** Every layer
     reports success and BlackHole receives exact digital silence. If the listener shows
     −120.0 dBFS while the app claims to be running, suspect permission before the audio graph.
@@ -207,8 +209,8 @@ silence rather than an error.
     `required condition is false: nullptr == Tap()` — an **Objective-C exception**, which no
     Swift `do/catch` in `AudioEngineController` can catch, so the process aborted instead of
     reporting an error. It fired on plugin switches, because `selectPlugin` cycles the engine.
-    Removal is now unconditional and tracked by `isTapInstalled`. Three `.ips` files on
-    2026-08-14 (09:54, 10:21, 10:22) are this exact crash. General lesson: `engine.connect`,
+    Removal is now unconditional and tracked by `isTapInstalled`. Three separate crash reports
+    in one morning were this exact failure. General lesson: `engine.connect`,
     `engine.attach`, and `installTap` signal misuse by *raising*, not by throwing — every one
     of them is a potential abort rather than a caught error.
 15. **The system default input is regularly BlackHole itself.** Pointing other apps at the
@@ -234,8 +236,8 @@ silence rather than an error.
     −120.0 dBFS, same moment. CoreAudio will not relay a subdevice's loopback into a second
     aggregate while the first holds it — and *direct* concurrent access to BlackHole works fine,
     which is exactly what makes this look like it should work. **Creatability is not signal
-    flow.** `VirtualMicrophone` is kept, unused, with this written on it; the route that avoids
-    a second aggregate is in "Next steps".
+    flow.** `VirtualMicrophone` carries this note. It is emphatically *not* dead code — it now
+    holds the driver UID, the aggregate UID, and the device name that routing is matched on.
 18. **`OSLogStore.getEntries` on the main thread is a UI freeze that grows over time.** The
     Activity panel called `EngineLogReader.recent()` from a `.task`, which inherits main-actor
     isolation, every two seconds — and an unbounded `getEntries` walks the process's whole log
@@ -298,6 +300,77 @@ silence rather than an error.
     was the open question before building anything), and the driver's UID is derived from its
     name — `kDevice_UID = kDriver_Name + "%ich" + "_UID"` → `PlugInput2ch_UID` — so renaming the
     driver silently changes what `VirtualMicrophone.driverUID` must match.
+23. **Copy-protected plugins need `allow-unsigned-executable-memory`, or they SIGKILL the host.**
+    UAD, Waves, Slate — anything wrapped in PACE/iLok — decrypt their own code into memory at
+    load time and execute it. Under the hardened runtime the kernel hashes executable pages on
+    fault-in, finds the rewritten page does not match the signature, and kills **the app**, not
+    the plugin: `EXC_BAD_ACCESS`, `SIGKILL (Code Signature Invalid)`, termination namespace
+    `CODESIGNING` / "Invalid Page", with the faulting frame inside
+    `PaceProtectionWrapper…handleWrapEvent` under `dlopen`. It is a kernel decision, so no
+    `do/catch` and no `withGraphBarrier` sees it — gotcha #21's barrier catches `NSException`,
+    and this is not one.
+    **`disable-library-validation` does not cover it.** That entitlement governs *who signed*
+    the library; this is about whether its pages may be rewritten after mapping. Both are
+    required, and having only the first is what made this look like a plugin bug.
+    The failure compounds through persistence: the plugin loads far enough to be saved, so
+    `AppModel.restore()` reinstantiates it on the next launch and the app dies again before the
+    menu bar icon appears. Most of the crashes observed while diagnosing this were the relaunch
+    loop rather than the original click; the escape hatch is the one `SessionStore` already
+    documents, deleting `session.json`.
+    Diagnosed against a control rather than by guessing: Ableton Live 12, which hosts these same
+    plugins successfully, carries exactly `disable-library-validation` +
+    `allow-unsigned-executable-memory` and no other `cs.*` entitlement. Verified after the fix
+    with the saved UAD chain intact — app resident, `chain UADx LA-2A Gray Compressor →
+    Nectar 4` in the log, and **−33.8 dBFS broadband** on the two-process listener.
+
+24. **An aggregate reaches through to its subdevices, so PlugInput was re-sizing other apps'
+    audio hardware.** Two mistakes compounded, and together they made PlugInput actively
+    disturb a DAW sharing the same interface.
+    First, the monitor device was **always** a subdevice of the engine's aggregate. Turning
+    monitoring off only wrote `-1` into its channels — the aggregate still *opened* the user's
+    output interface. The rationale recorded at the time was that a constant subdevice list
+    keeps the virtual device's channel offsets stable across a toggle, which bought nothing:
+    `setMonitorEnabled` cycles the engine, so the aggregate is destroyed and rebuilt and every
+    offset recomputed regardless.
+    Second, `startOnQueue` wrote a preferred **128-frame buffer** onto the aggregate. A CoreAudio
+    aggregate pushes its IO buffer size down onto its subdevices, so that write reached straight
+    through to the user's own interface and re-sized it underneath whatever else was using it.
+    Nothing restored the previous value on teardown, so it outlived the session. It was a `try?`
+    with no read-back, against the explicit advice on `BufferSize.set` and gotcha #5.
+    Symptom: crackle, dropouts, or a device error in a DAW, appearing while PlugInput ran and
+    persisting after it stopped — with nothing pointing at PlugInput as the cause.
+    Fixed both ways round. The monitor is now **absent** from the aggregate when monitoring is
+    off, not muted in it, and `BufferSize` has no setter any longer — the app reads whatever the
+    aggregate inherits and logs it. General lesson: **an aggregate is not a sandbox.** Anything
+    written to it is written to the user's real hardware.
+25. **`queue.sync` in `willTerminate` is a deadlock, however innocent the body looks.**
+    `stop()` was a `queue.sync`, justified on the grounds that teardown negotiates no
+    permissions. True of the *body*, irrelevant to the *queue*: the queue is held for the whole
+    of a start, and a start blocks inside `AudioDeviceCreateIOProcID` until the user answers the
+    microphone dialog. First run, click Start, then Quit before answering, and the main thread
+    blocked forever on a queue waiting for a dialog the now-frozen app could no longer show.
+    Force quit was the only way out, and it orphaned the aggregate on the way (gotcha #7, then
+    #20 for what the survivor costs the next launch).
+    `stopForTermination(timeout:)` replaces it: ask the queue, wait two seconds, and if it does
+    not answer destroy the devices directly through `AggregateRegistry`, which holds raw IDs
+    behind a lock precisely so cleanup is reachable without the queue.
+    The ordering in `AppModel.prepareForQuit` matters for the same reason. Teardown now runs
+    **before** the session save, because the save asks up to eight third-party plugins to
+    serialise their entire state on the main thread inside a bounded termination window — one
+    slow vendor and the process dies before the aggregate is destroyed. Lost knob positions are
+    much cheaper than an orphaned device.
+26. **Capturing the input device's first channel is wrong on most interfaces.** The input
+    channel map was `[offset]`, where `offset` is where the device's channels start inside the
+    aggregate — so it always selected the device's *first* channel. Correct for a built-in
+    microphone, and exact digital silence for anyone whose mic is in input 2 of an interface,
+    with `start()` succeeding, the meter reading 0.0, and the UI blaming microphone permissions
+    it had never checked. There is now an input-channel picker, persisted per device.
+    Two things to know before changing it. The map value must stay inside the range
+    `AVAudioEngine`'s input node believes the device has — indexing past it is *accepted* by
+    `AudioUnitSetProperty`, *reads back correctly*, and then fails `engine.start()` with
+    `-10875` (gotcha #19), so the read-back proves less here than it appears to. And a channel
+    index only means something on the device it was chosen on: `settingInput` resets it, and
+    `refresh()` clamps it, or a saved channel outlives its interface and refuses every start.
 
 ## Persistence
 
@@ -332,10 +405,14 @@ whether the engine actually started. Delete it to reset the app.
 
 ## Next steps
 
-- **Public release is planned and scoped in [RELEASE.md](RELEASE.md).** Decisions already
-  taken there: direct distribution with a notarized `.pkg`, the driver bundled under
-  GPL-3.0 compliance, and therefore **no Mac App Store**. Read it before touching signing,
-  packaging, or the driver's licensing.
+- **Distribution is settled, and two of the decisions are not worth relitigating.**
+  Direct distribution with a notarized `.pkg`, and the driver bundled under GPL-3.0
+  compliance. The second forces the first: GPL-3.0's anti-Tivoization terms conflict with
+  App Store terms, so **the Mac App Store is closed off** for as long as the driver ships
+  inside the installer. The fallback, if that ever inverts, is to unbundle the driver and have
+  users install BlackHole themselves — which costs the "PlugInput" device name.
+  `make-pkg.sh` refuses to build if the driver's `LICENSE` is missing, because that is the one
+  packaging mistake a later build cannot correct.
 
 - **Naming the mic "PlugInput" is DONE — via a driver, not an aggregate.** `make-driver.sh`
   builds a renamed BlackHole (`kDriver_Name` / `kDevice_Name`, pinned to v0.6.1) and installs it
@@ -343,9 +420,13 @@ whether the engine actually started. Delete it to reset the app.
   stay closed — do not revisit #17 or #19 — but the conclusion drawn from them was wrong: it
   said the remaining route was "a substantially larger piece of work", when BlackHole
   *documents* renaming as a supported build-time customization. It is one `xcodebuild`.
-  **The GPL-3.0 gate is unresolved.** A renamed build is a derivative work: distributing it
-  obliges a source offer, and BlackHole's README asks distributors to contact Existential Audio.
-  Fine for local use; settle it before shipping.
+  **GPL-3.0 obligations, and how they are met.** A renamed build is a derivative work, so
+  recipients are owed the corresponding source. Since the rename is entirely build flags with no
+  source edit, the corresponding source is BlackHole v0.6.1 plus `make-driver.sh` — which pins
+  the tag and records every flag — so a public repository *is* the offer, with nothing extra to
+  maintain. The license text ships inside the bundle, and README states plainly that this is a
+  modified build, not the official binary, and not supported by Existential Audio. Contacting
+  Existential Audio is a courtesy their README asks for, not a license term.
 - **Confirm the chain UI by hand.** The engine below it is measured; the buttons are not. Worth
   one pass: add two or three effects, reorder with ↑/↓, toggle bypass while running (should be
   seamless — it is the one edit that does not cycle the engine), open two plugin windows at
@@ -354,8 +435,13 @@ whether the engine actually started. Delete it to reset the app.
 - **Chain presets.** The chain is already one `Codable` value, so saving named chains is close to
   free: a directory of `PluginChain` JSON beside `session.json`, and a picker. The invariant that
   each slot's state travels with its own plugin is what makes a preset portable.
-- **Remaining UI polish:** monitor/output device pickers. The searchable browser, dB meter,
-  routing summary, chain editor, latency badge, monitor toggle, and activity log are done.
+- **Remaining UI polish:** an explicit monitor/output device picker — monitoring currently
+  follows the system default output. The searchable browser, dB meter, routing summary, chain
+  editor, latency badge, monitor toggle, input-channel picker, and activity log are done.
+- **Still missing for a confident v1:** an app icon, crash reporting (with in-process plugin
+  hosting, crash reports are the only way to learn which plugin broke someone's setup), and an
+  update mechanism. Retrofitting updates onto already-installed copies is painful, so it is
+  worth deciding before 1.0.
 
 Persistence and the login item are built — see "Persistence" above.
 

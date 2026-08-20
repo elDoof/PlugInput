@@ -19,10 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-PlugInput bundles a modified build of BlackHole (https://github.com/ExistentialAudio/BlackHole),
-copyright Existential Audio Inc., licensed under GPL-3.0. That driver is a separate work,
-distributed alongside this software rather than linked into it, and its full license text
-ships inside the driver bundle at Contents/Resources/LICENSE.

@@ -16,6 +16,7 @@ microphone -> [ your effect chain ] -> PlugInput -> Zoom / Discord / OBS
 ## Features
 
 * Chain up to 8 Audio Unit effects, in any order, with per-effect bypass.
+* Pick which input channel your microphone is on, for interfaces with more than one.
 * Each plugin opens its own vendor interface. Several can be open at once.
 * Settings, chain order, and device selection are saved and restored on launch.
 * Optional headphone monitoring, independent of what other apps receive.
@@ -28,24 +29,30 @@ macOS 14 (Sonoma) or later, on Apple silicon or Intel.
 
 ## Installation
 
-Download the latest `PlugInput.pkg` from [Releases](../../releases) and run it. The
+Download the latest `PlugInput-<version>.pkg` from [Releases](../../releases) and run it. The
 installer places the app in `/Applications` and an audio driver in
 `/Library/Audio/Plug-Ins/HAL`, then restarts CoreAudio so the device appears immediately.
 
 On first launch, macOS will ask for microphone access. PlugInput cannot capture anything
 until you grant it.
 
-To remove everything later:
+**If PlugInput becomes your system microphone.** macOS sometimes makes a newly installed audio
+device the default input. If that happens, apps that follow the system default will hear
+silence. PlugInput notices and offers a one-click fix in its menu; you can also set it back
+yourself under System Settings > Sound > Input.
+
+To remove everything later, run the uninstaller that ships inside the app:
 
 ```bash
-./uninstall.sh          # app and driver
-./uninstall.sh --all    # also delete saved settings
+/Applications/PlugInput.app/Contents/Resources/uninstall.sh          # app and driver
+/Applications/PlugInput.app/Contents/Resources/uninstall.sh --all    # also delete settings
 ```
 
 ## Usage
 
 1. Click the waveform icon in the menu bar.
-2. Choose your **Input**: a microphone or audio interface.
+2. Choose your **Input**: a microphone or audio interface. On an interface with several
+   inputs, pick the **Channel** your microphone is plugged into.
 3. Open the **Effect chain** and search your installed Audio Units. Click one to add it.
 4. Press **Start**.
 5. In Zoom, Discord, or OBS, select **PlugInput** as the microphone.
@@ -71,6 +78,10 @@ speakers rather than headphones, or the processed output will be picked back up 
 microphone and feed back. This is especially loud with a compressor in the chain.
 
 Monitoring does not affect what other applications receive.
+
+Turning it off does more than mute: PlugInput stops opening your output device altogether.
+That matters if you use the same interface in a DAW — with monitoring off, PlugInput leaves it
+entirely alone.
 
 ## Building from source
 
@@ -162,4 +173,6 @@ with the build flags recorded in [`make-driver.sh`](make-driver.sh).
 PlugInput is released under the MIT License. See [LICENSE](LICENSE).
 
 The bundled audio driver is a separate work under GPL-3.0, distributed alongside the app
-rather than linked into it. Its license text ships inside the driver bundle.
+rather than linked into it. See [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES) for the details,
+including what was modified and where to get the corresponding source. Its full license text
+also ships inside the driver bundle.

@@ -1,0 +1,47 @@
+Third-party components distributed with PlugInput
+=================================================
+
+PlugInput itself is released under the MIT License; see LICENSE.
+
+BlackHole (as "PlugInput.driver")
+---------------------------------
+
+The audio driver installed at /Library/Audio/Plug-Ins/HAL/PlugInput.driver is a MODIFIED
+build of BlackHole by Existential Audio Inc.
+
+    Upstream:  https://github.com/ExistentialAudio/BlackHole
+    Version:   v0.6.1
+    Copyright: Existential Audio Inc.
+    License:   GNU General Public License v3.0
+
+THIS IS NOT THE OFFICIAL BLACKHOLE BINARY, AND IT IS NOT SUPPORTED BY EXISTENTIAL AUDIO.
+Please report any problem with PlugInput to PlugInput's own issue tracker, not to them.
+
+What was modified
+-----------------
+
+Nothing in the source. The driver is built from an unmodified v0.6.1 checkout with three
+compile-time constants overridden, so that the device appears under its own name and does not
+collide with an existing BlackHole installation:
+
+    kDriver_Name     = "PlugInput"
+    kDevice_Name     = "PlugInput"
+    kPlugIn_BundleID = "com.pluginput.driver"
+
+Corresponding source (GPLv3 section 6)
+--------------------------------------
+
+The corresponding source is BlackHole v0.6.1 as published at the URL above, together with
+make-driver.sh in this repository, which pins that exact tag and records every build flag
+applied to it. Both are publicly available, which satisfies the obligation to accompany the
+binary with its source.
+
+The full GPL-3.0 text also ships inside the installed driver bundle, at
+/Library/Audio/Plug-Ins/HAL/PlugInput.driver/Contents/Resources/LICENSE.
+
+Relationship to the app
+-----------------------
+
+PlugInput.app links no BlackHole code. It communicates with the driver through CoreAudio's
+public interfaces, as any audio application does with any audio device. Shipping both in one
+installer is mere aggregation under GPLv3 section 5, so the app's own MIT license is unaffected.
