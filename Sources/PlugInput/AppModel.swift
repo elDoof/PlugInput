@@ -24,6 +24,24 @@ final class AppModel {
 
     private(set) var selectedInputUID: String?
 
+    /// Which of the selected device's channels carries the microphone, zero-based.
+    ///
+    /// Only meaningful on interfaces with more than one input. Defaulting to 0 keeps a built-in
+    /// mic — and every existing saved session — behaving exactly as before, while giving anyone
+    /// whose mic is on input 2 a way to say so. Without it they got exact digital silence and a
+    /// message blaming microphone permissions.
+    private(set) var selectedInputChannel = 0
+
+    /// Channels worth offering for the current input device; empty when there is no choice.
+    var selectableInputChannels: [Int] {
+        guard let device = selectedInputDevice, device.inputChannels > 1 else { return [] }
+        return Array(0..<device.inputChannels)
+    }
+
+    var selectedInputDevice: AudioDevice? {
+        inputDevices.first { $0.uid == selectedInputUID }
+    }
+
     /// The ordered effect chain, as an immutable value. Every edit computes a new one and
     /// persists it, so a failed rebuild cannot leave the saved chain half-changed.
     private(set) var chain: PluginChain = .empty
@@ -42,6 +60,17 @@ final class AppModel {
     }
 
     private(set) var isRunning = false
+
+    /// True when the system's default input is PlugInput's own loopback driver.
+    ///
+    /// macOS elects a newly appeared device as the default input, and installing the driver
+    /// restarts `coreaudiod`, which is exactly that trigger. Every app that follows the system
+    /// default — Zoom, Discord, a DAW — then listens to a loopback carrying silence unless
+    /// PlugInput happens to be running and routing into it. Worth saying out loud, because from
+    /// the user's side this presents as "my microphone stopped working", with nothing pointing
+    /// at the app that caused it.
+    private(set) var isDefaultInputHijacked = false
+
     private(set) var isMonitorEnabled = true
     private(set) var status = ""
     private(set) var inputPeak: Float = 0
@@ -60,6 +89,15 @@ final class AppModel {
     private static let driverMissingStatus =
         "PlugInput audio driver not found — reinstall PlugInput to restore it"
 
+    /// Open plugin interfaces, owned here rather than by a view.
+    ///
+    /// Each of three views used to hold its own `@State` controller, so two of them tracked
+    /// nothing and the third died with the console window — stranding any plugin windows it had
+    /// opened on screen, unreachable, while a fresh controller happily opened a *second* window
+    /// for the same slot. Owning them alongside the units they display is what lets `removeSlot`
+    /// and `prepareForQuit` guarantee an interface never outlives its `AVAudioUnit`.
+    let pluginWindows = PluginWindowController()
+
     private let engine = AudioEngineController()
     private let store: SessionStore?
     private var snapshot: SessionSnapshot = .empty
@@ -70,22 +108,55 @@ final class AppModel {
     private var hasRestored = false
     private var hasQuit = false
 
+    /// Serialises transport work against itself.
+    ///
+    /// `@MainActor` orders statements but not *tasks* across suspension points, and every route
+    /// into `start()`/`stop()` goes through `await` — `toggle`, `selectInput`,
+    /// `setMonitorEnabled`, and each chain edit. Two overlapping starts would each call
+    /// `startMetering()`, and the second would overwrite `meterTimer` while the first kept
+    /// firing forever against a strongly captured `self`.
+    private var isTransportBusy = false
+
     /// A plugin window has no "save" button — parameters change whenever the user drags a knob.
     /// Capturing on a slow timer bounds what a crash can cost without serializing the plugin's
     /// whole state on every mouse move.
     private static let autosaveInterval: TimeInterval = 30
 
-    init(store: SessionStore? = try? SessionStore.default()) {
-        self.store = store
+    /// `store` is injectable for testing; `nil` means "open the default location", which is what
+    /// the app does.
+    ///
+    /// The open happens here rather than in a default argument. It used to read
+    /// `store: SessionStore? = try? SessionStore.default()`, which threw the reason away — and a
+    /// nil store turns every later save into a silent no-op, so a user whose Application Support
+    /// directory cannot be written lost every setting on every launch, forever, with nothing
+    /// said about why.
+    init(store: SessionStore? = nil) {
+        var openFailure: String?
+        if let store {
+            self.store = store
+        } else {
+            do {
+                self.store = try SessionStore.default()
+            } catch {
+                self.store = nil
+                openFailure = "Settings cannot be saved — \(error.localizedDescription). "
+                    + "PlugInput will still run, but nothing will be remembered between launches."
+            }
+        }
 
         do {
-            snapshot = try store?.load() ?? .empty
+            snapshot = try self.store?.load() ?? .empty
         } catch {
             // Keep running with a clean session rather than refusing to launch, but say so —
             // silently reverting to defaults reads as "my settings vanished".
             status = "Saved settings could not be read and were ignored: \(error.localizedDescription)"
         }
+        // An unopenable store is the more serious of the two failures — it is permanent rather
+        // than one-off — so it wins the single status slot.
+        if let openFailure { status = openFailure }
+
         selectedInputUID = snapshot.inputUID
+        selectedInputChannel = snapshot.inputChannel
         isMonitorEnabled = snapshot.isMonitorEnabled
         // Shown immediately, before the units behind it exist — `restore()` instantiates those
         // asynchronously, and a chain that appeared one plugin at a time would read as data loss.
@@ -101,7 +172,30 @@ final class AppModel {
             MainActor.assumeIsolated { self?.prepareForQuit() }
         }
 
+        // The engine stops itself when the devices under it change. Without this the UI would go
+        // on claiming "Running" against a graph that no longer exists.
+        engine.onUnexpectedStop { [weak self] reason in
+            Task { @MainActor in self?.handleUnexpectedStop(reason) }
+        }
+
         scheduleRestore()
+    }
+
+    /// The engine stopped on its own — an interface unplugged, a device reconfigured.
+    private func handleUnexpectedStop(_ reason: String) {
+        guard isRunning else { return }
+
+        stopMetering()
+        isRunning = false
+        inputPeak = 0
+        status = reason
+        // Deliberately not resumed on the next launch. A device that vanished mid-session is
+        // likelier to still be missing than to be back, and a resume that fails on every launch
+        // is a worse experience than a Start button pressed once.
+        update { $0.settingRunning(false) }
+        // The device list has changed by definition, so re-read it rather than leaving stale
+        // names sitting next to a stopped engine.
+        Task { await refresh() }
     }
 
     /// Waits for AppKit to finish launching before touching CoreAudio.
@@ -174,6 +268,11 @@ final class AppModel {
         if snapshot.inputUID != selectedInputUID {
             update { $0.settingInput(selectedInputUID) }
         }
+        // Records a channel that `apply` had to clamp, for the same reason: chasing a setting
+        // that can no longer apply is how a saved session keeps breaking every launch.
+        if snapshot.inputChannel != selectedInputChannel {
+            update { $0.settingInputChannel(selectedInputChannel) }
+        }
     }
 
     private func apply(_ environment: AudioEnvironment) {
@@ -191,10 +290,46 @@ final class AppModel {
             systemDefault: environment.systemDefaultInputUID
         )
 
+        isDefaultInputHijacked = environment.systemDefaultInputUID == VirtualMicrophone.driverUID
+
+        // A saved channel can outlive the device it was chosen on — the interface gets unplugged
+        // and the fallback is a one-channel built-in mic. Clamping here stops `start()` refusing
+        // with "channel 5 does not exist" over a choice the user can no longer even see.
+        if selectedInputChannel >= (selectedInputDevice?.inputChannels ?? 1) {
+            selectedInputChannel = 0
+        }
+
         if virtualDevice == nil {
             status = Self.driverMissingStatus
         } else if status == Self.driverMissingStatus {
             status = ""
+        }
+    }
+
+    /// Points the system default input back at a real microphone.
+    ///
+    /// Only ever called from the warning this app shows about `isDefaultInputHijacked`, because
+    /// the default input is a system-wide setting and changing it uninvited is the same class of
+    /// rudeness the warning exists to complain about.
+    func restoreDefaultInput() async {
+        guard let device = selectedInputDevice ?? inputDevices.first else {
+            status = "No microphone available to set as the system default."
+            return
+        }
+
+        do {
+            try DeviceEnumerator.setDefaultInputDevice(device.id)
+            EngineLog.logger.info(
+                "system default input set back to \(device.name, privacy: .public)"
+            )
+            // Read it back rather than assuming the write took — the recurring lesson of
+            // gotcha #5, and the flag the warning is drawn from must not go stale.
+            await refresh()
+            if !isDefaultInputHijacked {
+                status = "System default input set to \(device.name)."
+            }
+        } catch {
+            status = "Could not change the system default input: \(error.localizedDescription)"
         }
     }
 
@@ -212,9 +347,28 @@ final class AppModel {
     func selectInput(_ uid: String?) async {
         guard uid != selectedInputUID else { return }
         selectedInputUID = uid
+        // Back to the first channel: an index only means something on the device it was picked
+        // on, and carrying "channel 4" onto a mono built-in mic would refuse every start.
+        // `SessionSnapshot.settingInput` enforces the same rule on the persisted side.
+        selectedInputChannel = 0
         update { $0.settingInput(uid) }
         // Switching devices means rebuilding the aggregate, so the engine is cycled rather
         // than reconfigured in place.
+        await restartIfRunning()
+    }
+
+    /// Picks which of a multi-input interface's channels carries the microphone.
+    ///
+    /// Zero-based here; the UI shows it one-based, because interfaces label their inputs
+    /// starting at 1 and a picker disagreeing with the silkscreen is its own bug report.
+    func selectInputChannel(_ channel: Int) async {
+        guard channel != selectedInputChannel,
+              selectableInputChannels.contains(channel)
+        else { return }
+
+        selectedInputChannel = channel
+        update { $0.settingInputChannel(channel) }
+        // The channel map is applied during start, so this is a rebuild like any other.
         await restartIfRunning()
     }
 
@@ -256,6 +410,9 @@ final class AppModel {
         guard let slot = chain.slot(id) else { return }
         EngineLog.logger.info("chain: removed \(slot.plugin.name, privacy: .public)")
 
+        // Before the unit goes: a vendor view controller left holding a detached unit is a
+        // crash waiting for the next redraw.
+        pluginWindows.close(id)
         loadedUnits[id] = nil
         apply(chain.removing(id))
         if chain.isEmpty { stopAutosave() }
@@ -361,6 +518,10 @@ final class AppModel {
     /// the main actor stays responsive while CoreAudio negotiates with coreaudiod. See the
     /// isolation note on `AudioEngineController`.
     func start() async {
+        guard !isTransportBusy else { return }
+        isTransportBusy = true
+        defer { isTransportBusy = false }
+
         guard let inputUID = selectedInputUID,
               let input = inputDevices.first(where: { $0.uid == inputUID })
         else {
@@ -375,28 +536,43 @@ final class AppModel {
             status = Self.driverMissingStatus
             return
         }
-        guard let monitorDevice else {
-            status = "No output device available"
-            return
-        }
-        // Monitoring into either the loopback or our own published device would feed the
-        // processed signal back into itself. The second case only became possible once the
-        // aggregate went public, and it is easy to hit by accident: "PlugInput" now appears in
-        // the system's output list too.
-        guard monitorDevice.uid != virtualDevice.uid,
-              monitorDevice.uid != VirtualMicrophone.aggregateUID
-        else {
-            let reason = "System output is set to \(monitorDevice.name). "
-                + "Switch it to your speakers or headphones."
-            status = reason
-            EngineLog.logger.error("engine start refused: \(reason, privacy: .public)")
-            return
+        // Resolved to one value, because `nil` is how the engine is told to run without a
+        // monitoring leg — and that is not merely a muted channel pair: the output device is
+        // then left out of the aggregate entirely, so PlugInput does not open the user's
+        // interface at all. See `AudioEngineController.orderedSubDevices`.
+        //
+        // Everything below is therefore checked only when monitoring is actually on. The
+        // absence of an output device used to refuse the start outright, which made a headless
+        // Mac — or one transient CoreAudio hiccup in the default-output read — unable to run
+        // the virtual microphone, for a device the user had explicitly switched off.
+        let monitor: AudioDevice?
+        if isMonitorEnabled {
+            guard let monitorDevice else {
+                status = "No output device available for monitoring. Turn Monitor off to run "
+                    + "without one."
+                return
+            }
+            // Monitoring into either the loopback or our own aggregate would feed the processed
+            // signal back into itself.
+            guard monitorDevice.uid != virtualDevice.uid,
+                  monitorDevice.uid != VirtualMicrophone.aggregateUID
+            else {
+                let reason = "System output is set to \(monitorDevice.name). "
+                    + "Switch it to your speakers or headphones, or turn Monitor off."
+                status = reason
+                EngineLog.logger.error("engine start refused: \(reason, privacy: .public)")
+                return
+            }
+            monitor = monitorDevice
+        } else {
+            monitor = nil
         }
 
         EngineLog.logger.info(
             """
-            starting: input \(input.name, privacy: .public), \
-            monitor \(monitorDevice.name, privacy: .public), \
+            starting: input \(input.name, privacy: .public) \
+            ch\(self.selectedInputChannel + 1, privacy: .public), \
+            monitor \(monitor?.name ?? "off", privacy: .public), \
             virtual \(virtualDevice.name, privacy: .public)
             """
         )
@@ -404,10 +580,10 @@ final class AppModel {
         do {
             try await engine.start(
                 input: input,
-                monitor: monitorDevice,
+                monitor: monitor,
                 virtual: virtualDevice,
                 effects: .init(orderedUnits),
-                isMonitorEnabled: isMonitorEnabled
+                inputChannel: selectedInputChannel
             )
             isRunning = true
             update { $0.settingRunning(true) }
@@ -424,6 +600,10 @@ final class AppModel {
     }
 
     func stop() async {
+        guard !isTransportBusy else { return }
+        isTransportBusy = true
+        defer { isTransportBusy = false }
+
         stopMetering()
         await engine.stopAsync()
         isRunning = false
@@ -435,21 +615,49 @@ final class AppModel {
     /// Final save and teardown, idempotent because both the Quit button and `willTerminate`
     /// reach it. Leaves `isRunning` in the snapshot untouched, so quitting while running means
     /// the next launch comes back up running.
+    ///
+    /// **The order is the point.** Teardown runs before the save, not after. macOS gives a
+    /// terminating app a bounded window before killing it outright, and `persistSession()`
+    /// spends that budget asking up to eight third-party plugins to serialise their entire
+    /// state on the main thread — vendors that archive sample banks or impulse responses are
+    /// not quick about it. With the save first, one slow plugin meant the process died before
+    /// the aggregate was destroyed, leaving exactly the orphan gotcha #7 is about, which then
+    /// blocks the next launch's start (gotcha #20). A few seconds of lost knob positions is by
+    /// far the cheaper failure, so it goes last.
+    ///
+    /// Plugin windows close before the units behind them are torn down: a vendor's view
+    /// controller outliving the `AVAudioUnit` that owns it is a well-known AU-host crash on exit.
     func prepareForQuit() {
         guard !hasQuit else { return }
         hasQuit = true
 
-        persistSession()
         stopMetering()
         stopAutosave()
-        // Destroys the aggregate, which is now a *visible* device — an orphan would sit in every
-        // app's microphone list advertising a mic that produces nothing (gotcha #7).
-        engine.stop()
+        pluginWindows.closeAll()
+        engine.stopForTermination()
         isRunning = false
+        persistSession()
     }
 
     var effectLatencyMilliseconds: Double {
         engine.effectLatencySeconds * 1000
+    }
+
+    /// What to suggest when the engine is running and the meter reads exactly zero.
+    ///
+    /// A microphone macOS has not authorized returns silence rather than an error (gotcha #11),
+    /// so permissions are always worth naming. But this used to assert them as *the* explanation
+    /// — "macOS may not have granted microphone access" — without having checked, and on a
+    /// multi-input interface the likelier cause by far is that the microphone is in a different
+    /// socket than the channel being captured. Sending someone to System Settings to re-grant a
+    /// permission they already have is a long way from the actual problem.
+    var noSignalHint: String {
+        guard let device = selectedInputDevice, device.inputChannels > 1 else {
+            return "No signal. If this persists, macOS may not have granted microphone access."
+        }
+        return "No signal on channel \(selectedInputChannel + 1) of \(device.name). "
+            + "Check the microphone is in that input, or pick another channel. If it persists, "
+            + "check Privacy & Security > Microphone."
     }
 
     // MARK: - Login item
@@ -505,10 +713,17 @@ final class AppModel {
     // MARK: - Timers
 
     private func startMetering() {
+        // Never leave a previous timer running. `meterTimer` used to be overwritten outright,
+        // so an overlapping start orphaned a 20 Hz timer that kept firing — and, capturing
+        // `self` strongly, kept the whole model alive with it. `stopMetering` could only ever
+        // cancel the newest of them. The `isTransportBusy` guard should make an overlap
+        // impossible now; this makes it harmless if one ever gets through anyway.
+        stopMetering()
         meterTicks = 0
 
-        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / meterHz, repeats: true) { _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / meterHz, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
+                guard let self else { return }
                 self.inputPeak = self.engine.inputPeak
                 self.meterTicks += 1
 
@@ -532,8 +747,8 @@ final class AppModel {
     private func startAutosave() {
         guard autosaveTimer == nil else { return }
 
-        let timer = Timer.scheduledTimer(withTimeInterval: Self.autosaveInterval, repeats: true) { _ in
-            MainActor.assumeIsolated { self.persistSession() }
+        let timer = Timer.scheduledTimer(withTimeInterval: Self.autosaveInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.persistSession() }
         }
         RunLoop.main.add(timer, forMode: .common)
         autosaveTimer = timer

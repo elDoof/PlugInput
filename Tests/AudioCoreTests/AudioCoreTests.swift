@@ -137,6 +137,40 @@ struct OrderedSubDevicesTests {
         #expect(layout.outputOffsets["bh"] == 2)
         #expect(layout.totalOutputChannels == 4)
     }
+
+    @Test("monitoring off leaves the output device out of the aggregate entirely")
+    func nilMonitorIsExcluded() {
+        // This is the fix for PlugInput disturbing other audio software. An aggregate opens
+        // every subdevice it names, so the old behaviour — keep the monitor, mute its channels
+        // — meant a second IOProc on the user's interface, plus the aggregate pushing its
+        // buffer size down onto it, all for a leg carrying nothing. A DAW on that same
+        // interface hears the result as crackle and dropouts.
+        let ordered = AudioEngineController.orderedSubDevices(
+            input: mic,
+            virtual: blackHole,
+            monitor: nil
+        )
+
+        #expect(ordered.map(\.uid) == ["mic", "bh"])
+        #expect(!ordered.contains { $0.uid == "spk" })
+    }
+
+    @Test("the virtual device still resolves an output offset with no monitor")
+    func nilMonitorStillRoutesToVirtual() {
+        // Dropping the monitor must not cost the destination that matters. If the virtual
+        // device lost its offset here, `applyOutputChannelMap` would write an all -1 map and
+        // other apps would receive exact digital silence — with every layer reporting success.
+        let ordered = AudioEngineController.orderedSubDevices(
+            input: mic,
+            virtual: blackHole,
+            monitor: nil
+        )
+        let layout = AggregateChannelLayout(orderedSubDevices: ordered)
+
+        #expect(layout.inputOffsets["mic"] == 0)
+        #expect(layout.outputOffsets["bh"] == 0)
+        #expect(layout.totalOutputChannels == 2)
+    }
 }
 
 /// Environment-dependent: asserts against whatever Audio Units are installed on this machine.

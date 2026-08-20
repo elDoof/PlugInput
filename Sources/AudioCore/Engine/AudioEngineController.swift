@@ -7,7 +7,9 @@ import Foundation
 /// The start sequence here is not arbitrary. Every step is one that Phase 0 proved necessary
 /// against real hardware, and several of them fail *silently* if reordered or skipped:
 ///
-/// 1. Build a private aggregate of `[input, virtual, monitor]`, input as clock master.
+/// 1. Build a private aggregate of `[input, virtual]` plus the monitor *only if monitoring is
+///    on*, input as clock master. Leaving the monitor out is what stops PlugInput opening the
+///    user's output interface — and re-sizing its buffer — for a leg carrying nothing.
 /// 2. Bind both engine sides to it, then **read the binding back** — setting `CurrentDevice`
 ///    on one node does not bind the other, and the wrong device still produces plausible audio.
 /// 3. Apply the input channel map to isolate the mic. Mandatory: the aggregate also exposes
@@ -62,10 +64,81 @@ public final class AudioEngineController: @unchecked Sendable {
     private var publishedState: State = .stopped
     private var publishedEffectLatency: Double = 0
 
-    /// Frames per buffer requested from the aggregate. 128 measured ≈ 2.7 ms in Phase 0.
-    public let preferredBufferFrames: UInt32 = 128
+    /// Told when the engine tears itself down for a reason the user did not ask for. Guarded by
+    /// `publishedLock` like the rest of the cross-thread state.
+    private var unexpectedStopHandler: (@Sendable (String) -> Void)?
+    private var configurationObserver: (any NSObjectProtocol)?
 
-    public init() {}
+    public init() {
+        // `AVAudioEngine` stops *itself* when the device it is bound to is reconfigured — an
+        // interface unplugged, a sample rate changed underneath it, an aggregate losing a
+        // subdevice. Nothing was listening for that, so the app went on believing it was
+        // running: menu bar icon lit, meter ticking against a dead tap, and — the part that
+        // actually harmed other software — **the aggregate still alive**, holding the user's
+        // input and output devices open indefinitely while producing nothing.
+        //
+        // Registered here rather than at start, because the notification can arrive during the
+        // teardown that follows one. `handleConfigurationChange` hops to `queue` and re-checks
+        // the state there, which is what makes that safe.
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            self?.handleConfigurationChange()
+        }
+    }
+
+    deinit {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+        }
+    }
+
+    /// Registers the callback for an unexpected stop. Set once, before the first start.
+    ///
+    /// The handler is invoked from the engine queue, never the main actor — callers hop.
+    public func onUnexpectedStop(_ handler: @escaping @Sendable (String) -> Void) {
+        publishedLock.lock()
+        unexpectedStopHandler = handler
+        publishedLock.unlock()
+    }
+
+    private func handleConfigurationChange() {
+        queue.async {
+            // Only act if we believed we were running. A configuration change raised by our own
+            // teardown, or while already stopped, means nothing and must not be reported.
+            guard self.state == .running else { return }
+
+            // A configuration change is not, by itself, a problem — and treating it as one was a
+            // bug. `AVAudioEngine` posts this notification for its *own* reconfigurations too,
+            // and applying the output channel map after `start()` is enough to raise one: the
+            // engine came up correctly and then tore itself down 47ms later, every single time.
+            //
+            // The condition that actually matters is whether the engine is still running. It
+            // stops *itself* when the device underneath it disappears, and that is the case
+            // worth reacting to, because it is the one that would otherwise leave the aggregate
+            // holding the user's hardware open indefinitely.
+            guard !self.engine.isRunning else {
+                EngineLog.logger.info(
+                    "audio configuration changed, engine still running — no action needed"
+                )
+                return
+            }
+
+            EngineLog.logger.error(
+                "audio device configuration changed while running — tearing the engine down"
+            )
+            self.stopOnQueue()
+
+            self.publishedLock.lock()
+            let handler = self.unexpectedStopHandler
+            self.publishedLock.unlock()
+            handler?(
+                "The audio devices changed and PlugInput stopped. Press Start to resume."
+            )
+        }
+    }
 
     /// A plugin being handed from the UI to the engine queue.
     ///
@@ -73,8 +146,17 @@ public final class AudioEngineController: @unchecked Sendable {
     /// unit is created on the main actor, driven by `AVAudioEngine` on its own threads, and
     /// shown in a window by AppKit. The box makes the boundary visible in the signature instead
     /// of hiding it behind an implicit capture — the compiler cannot prove this safe, so the
-    /// claim belongs in the open. What makes it hold: the UI only ever hands a unit *over*, and
-    /// never mutates one the engine is using.
+    /// claim belongs in the open.
+    ///
+    /// **What actually makes it hold, stated honestly.** The array itself is handed over once
+    /// and never mutated afterwards. The *units* are a different matter: `AppModel.setBypass`
+    /// writes `shouldBypassEffect` on a unit the engine is rendering, and a plugin's own window
+    /// mutates its parameters continuously while audio flows. Both are deliberate — live bypass
+    /// with no dropout is the point of it — and both are safe because `AUAudioUnit` is
+    /// documented to accept parameter and bypass changes from any thread, not because this type
+    /// prevents them. An earlier version of this comment claimed the UI "never mutates one the
+    /// engine is using", which was simply untrue and is the sort of thing a maintainer would
+    /// have built on.
     public struct Effects: @unchecked Sendable {
         /// In signal order: the input feeds `units[0]`, and the last one feeds the mixer.
         public let units: [AVAudioUnit]
@@ -87,29 +169,39 @@ public final class AudioEngineController: @unchecked Sendable {
     /// Carries the start arguments across the one hop onto `queue`.
     private struct StartRequest: @unchecked Sendable {
         let input: AudioDevice
-        let monitor: AudioDevice
+        /// `nil` means monitoring is off, and is the *only* way to express that. See
+        /// `orderedSubDevices`: an off monitor is absent from the aggregate, not muted in it,
+        /// so a separate `isMonitorEnabled` flag beside a non-optional device would be a second
+        /// source of truth for one fact — and the pair could disagree.
+        let monitor: AudioDevice?
         let virtual: AudioDevice
         let effects: Effects
-        let isMonitorEnabled: Bool
+        /// Which of the input device's own channels carries the microphone, zero-based.
+        let inputChannel: Int
     }
 
     // MARK: - Lifecycle
 
     /// Awaiting this keeps the caller's thread — in practice the main thread — free while
     /// CoreAudio negotiates. See the isolation note above; this signature is the fix for it.
+    /// Pass `monitor: nil` to run without a monitoring leg — the output device is then not
+    /// opened at all, which is what keeps PlugInput out of the way of other audio software.
+    ///
+    /// `inputChannel` is zero-based and relative to the input *device*, not to the aggregate;
+    /// it selects which of a multi-input interface's channels carries the microphone.
     public func start(
         input: AudioDevice,
-        monitor: AudioDevice,
+        monitor: AudioDevice?,
         virtual: AudioDevice,
         effects: Effects,
-        isMonitorEnabled: Bool = true
+        inputChannel: Int = 0
     ) async throws {
         let request = StartRequest(
             input: input,
             monitor: monitor,
             virtual: virtual,
             effects: effects,
-            isMonitorEnabled: isMonitorEnabled
+            inputChannel: inputChannel
         )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
@@ -124,12 +216,36 @@ public final class AudioEngineController: @unchecked Sendable {
         }
     }
 
-    /// Synchronous on purpose. `AppModel` calls it from `willTerminate`, where there is no
-    /// chance to await and the aggregate must still be destroyed before the process exits
-    /// (gotcha #7). Blocking the caller is acceptable here precisely because teardown involves
-    /// no permission negotiation — the asymmetry with `start` is the whole point.
-    public func stop() {
-        queue.sync { stopOnQueue() }
+    /// Teardown for `willTerminate`, bounded so that quitting can never hang the app.
+    ///
+    /// Synchronous because there is nothing to await at that point, but **not** a `queue.sync`.
+    /// It used to be, on the reasoning that teardown negotiates no permissions — which is true
+    /// of the *body* and irrelevant to the *queue*. The queue is held for the entire duration of
+    /// a start, and a start blocks inside `AudioDeviceCreateIOProcID` until the user answers the
+    /// microphone dialog. So: first run, click Start, then Quit before answering the dialog, and
+    /// the main thread blocked forever on a queue that was waiting on a dialog the frozen app
+    /// could no longer show. Force quit was the only way out, and it took the aggregate with it.
+    ///
+    /// The bound turns that into a two-second worst case. If the queue does not answer,
+    /// `AggregateRegistry` destroys the devices directly — it holds raw IDs behind a lock
+    /// precisely so cleanup is reachable without the queue and without the main actor, which is
+    /// the one step that genuinely cannot be skipped (gotcha #7, and gotcha #20 for what a
+    /// survivor costs the *next* launch).
+    public func stopForTermination(timeout: TimeInterval = 2) {
+        let finished = DispatchSemaphore(value: 0)
+        queue.async {
+            self.stopOnQueue()
+            finished.signal()
+        }
+
+        guard finished.wait(timeout: .now() + timeout) == .timedOut else { return }
+        EngineLog.logger.error(
+            """
+            engine queue did not answer within \(timeout, privacy: .public)s — \
+            destroying aggregates directly
+            """
+        )
+        AggregateRegistry.destroyAll()
     }
 
     /// The same teardown, awaited instead of blocking.
@@ -154,29 +270,36 @@ public final class AudioEngineController: @unchecked Sendable {
         stopOnQueue()
 
         let subDevices = Self.orderedSubDevices(input: input, virtual: virtual, monitor: monitor)
-        // Private. Publishing this aggregate so other apps could select it directly was tried
-        // and does not work — gotchas #17 and #19. The name now comes from the HAL driver
-        // instead, which is what other apps select.
-        let device = try AggregateDevice(
-            uid: VirtualMicrophone.aggregateUID,
-            name: "PlugInput Engine",
-            subDevices: subDevices,
-            clockSourceUID: input.uid
-        )
-        aggregate = device
 
         do {
+            // Private. Publishing this aggregate so other apps could select it directly was
+            // tried and does not work — gotchas #17 and #19. The name now comes from the HAL
+            // driver instead, which is what other apps select.
+            //
+            // Inside the `do` so that a creation failure still publishes `.failed`. It used to
+            // sit above, where a throw escaped without ever setting the state the UI reads.
+            let device = try AggregateDevice(
+                uid: VirtualMicrophone.aggregateUID,
+                name: "PlugInput Engine",
+                subDevices: subDevices,
+                clockSourceUID: input.uid
+            )
+            aggregate = device
+
             try EngineDeviceBinding.bind(deviceID: device.id, on: engine)
             try verifyBinding(to: device.id)
-            try? BufferSize.set(preferredBufferFrames, on: device.id)
-            try applyInputChannelMap(inputUID: input.uid, layout: device.layout)
+            logBufferSize(of: device.id)
+            try applyInputChannelMap(
+                input: input,
+                channel: request.inputChannel,
+                layout: device.layout
+            )
 
             try buildGraph(
                 effects: request.effects.units,
                 virtual: virtual,
                 monitor: monitor,
-                layout: device.layout,
-                isMonitorEnabled: request.isMonitorEnabled
+                layout: device.layout
             )
 
             publish(state: .running)
@@ -253,9 +376,8 @@ public final class AudioEngineController: @unchecked Sendable {
     private func buildGraph(
         effects: [AVAudioUnit],
         virtual: AudioDevice,
-        monitor: AudioDevice,
-        layout: AggregateChannelLayout,
-        isMonitorEnabled: Bool
+        monitor: AudioDevice?,
+        layout: AggregateChannelLayout
     ) throws {
         let deviceFormat = engine.outputNode.inputFormat(forBus: 0)
         let inputNode = engine.inputNode
@@ -346,9 +468,8 @@ public final class AudioEngineController: @unchecked Sendable {
         // After start, because preparing the engine reconfigures the output unit.
         try applyOutputChannelMap(
             virtualUID: virtual.uid,
-            monitorUID: monitor.uid,
-            layout: layout,
-            isMonitorEnabled: isMonitorEnabled
+            monitorUID: monitor?.uid,
+            layout: layout
         )
     }
 
@@ -403,7 +524,7 @@ public final class AudioEngineController: @unchecked Sendable {
     /// The tap block, built `nonisolated` on purpose. Do not inline this back into the method.
     ///
     /// AVFAudio calls the block from `RealtimeMessenger.mServiceQueue`. A closure written
-    /// inline inside a method of this `@MainActor` class **inherits main-actor isolation** —
+    /// inline inside a method of a main-actor-isolated type **inherits that isolation** —
     /// dropping the `self` capture does not help, because the isolation belongs to the closure
     /// rather than to what it captures. Swift's executor check then kills the process with
     /// `EXC_BREAKPOINT` on the first audio buffer. Note the timing: with the microphone denied
@@ -424,6 +545,38 @@ public final class AudioEngineController: @unchecked Sendable {
 
     // MARK: - Verification and channel maps
 
+    /// Records the buffer size the aggregate actually settled on. Deliberately read-only.
+    ///
+    /// This used to *write* a preferred 128 frames here. That is a latency preference, not a
+    /// requirement — gotcha #9 measured the floor at 15 frames and recorded latency as a
+    /// non-issue for this app — and the write was actively harmful: a CoreAudio aggregate
+    /// pushes its buffer size down onto its subdevices, so PlugInput was reaching through the
+    /// aggregate and re-sizing the user's own audio interface, which a DAW on that same
+    /// interface hears as crackle and dropouts. Nothing restored the previous value on
+    /// teardown, so the damage outlived the session.
+    ///
+    /// It was also a `try?` with no read-back, against the explicit advice on `BufferSize.set`
+    /// and gotcha #5. Whatever the aggregate inherits is now simply reported.
+    private func logBufferSize(of deviceID: AudioObjectID) {
+        do {
+            let frames = try BufferSize.current(deviceID)
+            let range = try BufferSize.range(deviceID)
+            EngineLog.logger.info(
+                """
+                aggregate buffer \(frames, privacy: .public) frames \
+                (device supports \(range.lowerBound, privacy: .public)…\
+                \(range.upperBound, privacy: .public)) — inherited, not set
+                """
+            )
+        } catch {
+            // Diagnostic only, so a failure here must not fail the start — but it is logged
+            // rather than swallowed, which is what the old `try?` got wrong.
+            EngineLog.logger.error(
+                "could not read aggregate buffer size: \(String(describing: error), privacy: .public)"
+            )
+        }
+    }
+
     private func verifyBinding(to deviceID: AudioObjectID) throws {
         let boundInput = EngineDeviceBinding.currentDevice(of: engine.inputNode.audioUnit)
         let boundOutput = EngineDeviceBinding.currentDevice(of: engine.outputNode.audioUnit)
@@ -435,15 +588,40 @@ public final class AudioEngineController: @unchecked Sendable {
         }
     }
 
-    private func applyInputChannelMap(inputUID: String, layout: AggregateChannelLayout) throws {
-        guard let offset = layout.inputOffsets[inputUID] else {
+    /// Selects exactly one of the input device's channels and delivers it as mono.
+    ///
+    /// `channel` is zero-based within the *device*; `offset` is where that device's channels
+    /// begin inside the aggregate, so the hardware index is the sum. This used to be hardcoded
+    /// to the offset alone — always the device's first channel — which is correct for a
+    /// built-in mic and silently wrong for an interface whose microphone is on input 2. The
+    /// failure was the worst kind available here: `start()` succeeded, the meter read 0.0, and
+    /// the UI blamed microphone permissions.
+    ///
+    /// **Caution, per gotcha #19.** A map value that indexes past what `AVAudioEngine`'s input
+    /// node believes the device has is *accepted* by `AudioUnitSetProperty` and *reads back
+    /// correctly*, and then fails `engine.start()` with
+    /// `-10875 IsFormatSampleRateAndChannelCountValid`. The read-back below therefore proves
+    /// less than it appears to; the bound checked here is the device's own channel count, and
+    /// the real proof is a start that survives on multi-input hardware.
+    private func applyInputChannelMap(
+        input: AudioDevice,
+        channel: Int,
+        layout: AggregateChannelLayout
+    ) throws {
+        guard let offset = layout.inputOffsets[input.uid] else {
             throw AudioCoreError.message("input device is not part of the aggregate")
         }
         guard let unit = engine.inputNode.audioUnit else {
             throw AudioCoreError.message("input node has no audio unit")
         }
+        guard channel >= 0, channel < input.inputChannels else {
+            throw AudioCoreError.message(
+                "\(input.name) has \(input.inputChannels) input channel(s); "
+                    + "channel \(channel + 1) does not exist"
+            )
+        }
 
-        var map: [Int32] = [Int32(offset)]
+        var map: [Int32] = [Int32(offset + channel)]
         try checkStatus(
             AudioUnitSetProperty(
                 unit,
@@ -482,32 +660,33 @@ public final class AudioEngineController: @unchecked Sendable {
         EngineLog.logger.info(
             """
             input channel map \(map.description, privacy: .public) for \
-            \(inputUID, privacy: .public) — node reports \(nodeChannels, privacy: .public)ch
+            \(input.name, privacy: .public) — capturing channel \
+            \(channel + 1, privacy: .public) of \(input.inputChannels, privacy: .public), \
+            node reports \(nodeChannels, privacy: .public)ch
             """
         )
     }
 
     private func applyOutputChannelMap(
         virtualUID: String,
-        monitorUID: String,
-        layout: AggregateChannelLayout,
-        isMonitorEnabled: Bool
+        monitorUID: String?,
+        layout: AggregateChannelLayout
     ) throws {
         let total = layout.totalOutputChannels
         guard total > 0, let unit = engine.outputNode.audioUnit else {
             throw AudioCoreError.message("aggregate reports no output channels")
         }
 
-        // Fan the stereo bus into the virtual pair, and into the monitor pair only when
-        // monitoring is on. Writing every destination pair makes this robust to subdevice
-        // ordering; a `-1` entry is CoreAudio's "feed this channel nothing".
+        // Fan the stereo bus into the virtual pair, and into the monitor pair when there is
+        // one. Writing every destination pair makes this robust to subdevice ordering; a `-1`
+        // entry is CoreAudio's "feed this channel nothing".
         //
-        // Muting the monitor here rather than dropping it from the aggregate is deliberate: the
-        // aggregate's channel layout then stays identical whichever way the toggle sits, so
-        // flipping it cannot shift the virtual device's offsets. The user's reason for wanting
-        // it is speakers — the processed signal coming out loud enough for the microphone to
-        // pick it back up is a feedback loop, and this is the switch that opens it.
-        let destinations = isMonitorEnabled ? [virtualUID, monitorUID] : [virtualUID]
+        // A nil `monitorUID` means the monitor device is not in the aggregate at all, so there
+        // are no channels here to mute — see `orderedSubDevices` for why it is excluded rather
+        // than muted. The user's reason for turning monitoring off is speakers: the processed
+        // signal coming out loud enough for the microphone to pick it back up is a feedback
+        // loop, and this is the switch that closes it.
+        let destinations = [virtualUID, monitorUID].compactMap { $0 }
         var map = [Int32](repeating: -1, count: total)
         for uid in destinations {
             guard let offset = layout.outputOffsets[uid] else { continue }
@@ -528,13 +707,13 @@ public final class AudioEngineController: @unchecked Sendable {
         )
 
         let virtualOffset = layout.outputOffsets[virtualUID] ?? -1
-        let monitorOffset = layout.outputOffsets[monitorUID] ?? -1
+        let monitorOffset = monitorUID.flatMap { layout.outputOffsets[$0] } ?? -1
         EngineLog.logger.info(
             """
             output channel map \(map.description, privacy: .public) — \
             virtual at \(virtualOffset, privacy: .public), \
             monitor at \(monitorOffset, privacy: .public) \
-            (\(isMonitorEnabled ? "monitoring on" : "monitoring muted", privacy: .public))
+            (\(monitorUID == nil ? "monitoring off, device not opened" : "monitoring on", privacy: .public))
             """
         )
     }
@@ -553,15 +732,29 @@ public final class AudioEngineController: @unchecked Sendable {
     /// `AggregateChannelLayout`, so the maps follow automatically; nothing here is hardcoded.
     /// Collapses naturally when monitor and input are the same device — common with an
     /// interface that has its own headphone jack.
+    ///
+    /// **A nil monitor is left out of the aggregate entirely, rather than muted.** An aggregate
+    /// opens every subdevice it names, so keeping the monitor in the list and muting its
+    /// channels meant PlugInput held the user's output interface the whole time it ran — and a
+    /// CoreAudio aggregate pushes its IO buffer size down onto its subdevices, so a DAW sharing
+    /// that interface got a second IOProc and a competing buffer request for a leg that was
+    /// carrying silence. That was a real, reproduced source of interference with Ableton.
+    ///
+    /// The earlier rationale for muting instead — that a constant subdevice list keeps the
+    /// virtual device's offsets stable across a monitor toggle — bought nothing:
+    /// `AppModel.setMonitorEnabled` cycles the engine, so the aggregate is destroyed and
+    /// rebuilt and every offset recomputed either way.
+    ///
     /// `nonisolated` because it derives a value from its arguments and touches no engine
     /// state — that also makes it directly testable without hopping to the main actor.
     nonisolated static func orderedSubDevices(
         input: AudioDevice,
         virtual: AudioDevice,
-        monitor: AudioDevice
+        monitor: AudioDevice?
     ) -> [AudioDevice] {
         var ordered: [AudioDevice] = []
-        for device in [input, virtual, monitor] where !ordered.contains(where: { $0.uid == device.uid }) {
+        for device in [input, virtual, monitor].compactMap({ $0 })
+        where !ordered.contains(where: { $0.uid == device.uid }) {
             ordered.append(device)
         }
         return ordered

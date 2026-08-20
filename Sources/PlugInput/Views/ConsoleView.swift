@@ -19,7 +19,11 @@ struct ConsoleView: View {
                 transport
                 SignalChainView(model: model)
                 ChainEditorView(model: model)
-                LevelMeterView(peak: model.inputPeak, isRunning: model.isRunning)
+                LevelMeterView(
+                    peak: model.inputPeak,
+                    isRunning: model.isRunning,
+                    noSignalHint: model.noSignalHint
+                )
                 ActivityView()
                 Spacer(minLength: 0)
             }
@@ -146,6 +150,8 @@ private struct SignalChainView: View {
 private struct LevelMeterView: View {
     let peak: Float
     let isRunning: Bool
+    /// Supplied by the model, which is the only thing that knows the device and channel.
+    let noSignalHint: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -167,11 +173,12 @@ private struct LevelMeterView: View {
             }
             .frame(height: 8)
 
-            // Silence while running is the signature of an unauthorized microphone: macOS feeds
-            // zeros rather than reporting an error, so say so instead of showing a dead bar and
-            // letting it read as a broken app.
+            // Silence while running needs saying: macOS feeds zeros rather than reporting an
+            // error, so a dead bar with no explanation just reads as a broken app. The wording
+            // comes from the model because the likeliest cause depends on the device — see
+            // `AppModel.noSignalHint`.
             if isRunning, peak == 0 {
-                Text("No signal. If this persists, macOS may not have granted microphone access.")
+                Text(noSignalHint)
                     .font(.caption2)
                     .foregroundStyle(.orange)
             }

@@ -17,8 +17,13 @@ public enum AudioLevel {
     }
 
     /// 0...1 across `floorDecibels`...0 dBFS, for a progress bar.
+    ///
+    /// Clamped at both ends. The floor was already handled by `decibels`, but nothing capped the
+    /// top: a plugin with makeup gain can hand back an amplitude above 1.0, which produced a
+    /// fraction above 1.0 and a meter bar drawn outside its own container. Callers should not
+    /// each have to remember `min(_:1)` — one of the two already did, and the other did not.
     public static func meterFraction(fromAmplitude amplitude: Float) -> Double {
         let decibels = decibels(fromAmplitude: amplitude)
-        return (decibels - floorDecibels) / -floorDecibels
+        return min((decibels - floorDecibels) / -floorDecibels, 1)
     }
 }

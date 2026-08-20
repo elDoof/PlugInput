@@ -56,14 +56,23 @@ public enum DeviceEnumerator {
         try allDevices().first { $0.uid == uid }
     }
 
-    public static func device(nameContaining fragment: String) throws -> AudioDevice? {
-        try allDevices().first { $0.name.localizedCaseInsensitiveContains(fragment) }
-    }
-
-    /// Input devices worth offering the user, with our own virtual device filtered out —
-    /// selecting it as the source would route the processed signal back into itself.
-    public static func selectableInputs(excludingUID excluded: String?) throws -> [AudioDevice] {
-        try allDevices().filter { $0.hasInput && $0.uid != excluded }
+    /// Points the system's default input at a specific device.
+    ///
+    /// Needed because installing a loopback driver tends to *make* it the default input: macOS
+    /// elects a newly appeared device, and the installer restarts `coreaudiod`, which is a
+    /// common trigger for that election. The user is then left with everything that follows the
+    /// system default — Zoom, Ableton, anything — listening to a loopback carrying silence, with
+    /// nothing to indicate why. Setting it back needs no privileges, but it is a change to a
+    /// system-wide setting, so it happens only when the user explicitly asks for it.
+    public static func setDefaultInputDevice(_ deviceID: AudioObjectID) throws {
+        var addr = address(kAudioHardwarePropertyDefaultInputDevice)
+        var value = deviceID
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectSetPropertyData(
+                systemObject, &addr, 0, nil, UInt32(MemoryLayout<AudioObjectID>.size), pointer
+            )
+        }
+        try checkStatus(status, "AudioObjectSetPropertyData(defaultInputDevice=\(deviceID))")
     }
 
     private static func defaultDeviceID(_ selector: AudioObjectPropertySelector) throws -> AudioObjectID {
@@ -77,18 +86,15 @@ enum BufferSize {
         try propertyValue(deviceID, address(kAudioDevicePropertyBufferFrameSize), initial: UInt32(0))
     }
 
-    /// The device may clamp the request to its supported range, so callers should read
-    /// `current` back afterwards rather than assume the request stuck.
-    static func set(_ frames: UInt32, on deviceID: AudioObjectID) throws {
-        var addr = address(kAudioDevicePropertyBufferFrameSize)
-        var value = frames
-        let status = withUnsafeMutablePointer(to: &value) { pointer in
-            AudioObjectSetPropertyData(
-                deviceID, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), pointer
-            )
-        }
-        try checkStatus(status, "AudioObjectSetPropertyData(bufferFrameSize=\(frames))")
-    }
+    // There is deliberately no setter here any more.
+    //
+    // Writing this property on the engine's aggregate reached straight through to its
+    // subdevices — the user's own interface among them — and re-sized the buffer underneath
+    // whatever else was using it, which a DAW on that interface hears as crackle and dropouts.
+    // Nothing restored the old value afterwards, so it outlived the session. The app now reads
+    // whatever the aggregate inherits and logs it; see
+    // `AudioEngineController.logBufferSize(of:)`. Latency is not the constraint here — gotcha #9
+    // measured the floor at 15 frames — so there was never much to win and a lot to break.
 
     static func range(_ deviceID: AudioObjectID) throws -> ClosedRange<UInt32> {
         let value = try propertyValue(

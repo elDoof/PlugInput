@@ -11,7 +11,8 @@ import SwiftUI
 /// visible.
 struct ChainEditorView: View {
     let model: AppModel
-    @State private var pluginWindow = PluginWindowController()
+    /// The model owns these, so a window cannot outlive the view that opened it.
+    private var pluginWindow: PluginWindowController { model.pluginWindows }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {

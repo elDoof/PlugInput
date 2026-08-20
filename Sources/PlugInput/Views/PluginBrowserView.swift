@@ -3,7 +3,8 @@ import SwiftUI
 
 /// Search-first chooser for the installed effects.
 ///
-/// A flat `Picker` over 677 components is unusable, so the list is filtered by a search field
+/// A flat `Picker` over several hundred components is unusable, so the list is filtered by a
+/// search field
 /// and grouped by manufacturer. Selecting reloads the engine, which costs a brief dropout —
 /// hence a single click to choose and a separate button to open the plugin's own interface,
 /// rather than anything that swaps plugins as you arrow through the list.
@@ -11,7 +12,6 @@ struct PluginBrowserView: View {
     let model: AppModel
 
     @State private var query = ""
-    @State private var pluginWindow = PluginWindowController()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {

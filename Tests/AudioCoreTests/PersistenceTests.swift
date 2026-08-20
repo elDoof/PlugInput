@@ -290,3 +290,109 @@ struct SessionStoreTests {
         try? FileManager.default.removeItem(at: store.fileURL.deletingLastPathComponent())
     }
 }
+
+/// The input channel is the newest field, and the one most able to break an existing setup.
+///
+/// It exists because the engine used to capture the input device's *first* channel and only
+/// ever that one — right for a built-in microphone, and exact digital silence for anyone whose
+/// mic is on input 2 of an interface, with the UI blaming microphone permissions. Two things
+/// have to hold: every session file written before the field existed must still load, and a
+/// channel must never outlive the device it was chosen on.
+@Suite("Input channel persistence")
+struct InputChannelTests {
+    @Test("the first channel is the default")
+    func defaultsToFirstChannel() {
+        #expect(SessionSnapshot.empty.inputChannel == 0)
+    }
+
+    @Test("a session file written before the field existed loads on channel one")
+    func legacyFileDecodesToFirstChannel() throws {
+        // Arrange — no inputChannel key at all. A non-optional Codable property would throw
+        // here, and AppModel answers a failed load by discarding the whole session, so this is
+        // the difference between an upgrade and a wiped setup.
+        let legacy = Data("""
+        {
+          "inputUID" : "BuiltInMicrophoneDevice",
+          "isRunning" : true,
+          "isMonitorEnabled" : false,
+          "chain" : { "slots" : [] }
+        }
+        """.utf8)
+
+        // Act
+        let decoded = try JSONDecoder().decode(SessionSnapshot.self, from: legacy)
+
+        // Assert — the new field defaults, and nothing else is disturbed by its absence.
+        #expect(decoded.inputChannel == 0)
+        #expect(decoded.inputUID == "BuiltInMicrophoneDevice")
+        #expect(decoded.isRunning)
+        #expect(decoded.isMonitorEnabled == false)
+    }
+
+    @Test("a chosen channel survives a save and load")
+    func roundTrips() throws {
+        // Arrange
+        let original = SessionSnapshot.empty
+            .settingInput("interface-uid")
+            .settingInputChannel(2)
+
+        // Act
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(SessionSnapshot.self, from: data)
+
+        // Assert
+        #expect(decoded.inputChannel == 2)
+        #expect(decoded.inputUID == "interface-uid")
+    }
+
+    @Test("changing the input device resets the channel")
+    func changingDeviceResetsChannel() {
+        // Arrange — mic on input 3 of an eight-input interface.
+        let onInterface = SessionSnapshot.empty
+            .settingInput("interface-uid")
+            .settingInputChannel(2)
+
+        // Act — the interface is unplugged and the fallback is a mono built-in mic.
+        let onBuiltIn = onInterface.settingInput("builtin-uid")
+
+        // Assert — carrying channel 3 across would refuse every start with "channel 3 does not
+        // exist", which is a saved setting breaking a device it was never about.
+        #expect(onInterface.inputChannel == 2)
+        #expect(onBuiltIn.inputChannel == 0)
+    }
+
+    @Test("re-selecting the same device keeps the channel")
+    func reselectingSameDeviceKeepsChannel() {
+        // The reset must key on the device actually changing. `refresh()` re-applies the
+        // resolved input on every menu open, and if that counted as a change the user's channel
+        // would silently snap back to 1 each time they looked at the menu.
+        let original = SessionSnapshot.empty
+            .settingInput("interface-uid")
+            .settingInputChannel(3)
+
+        let same = original.settingInput("interface-uid")
+
+        #expect(same.inputChannel == 3)
+    }
+
+    @Test("setting the channel leaves every other field alone")
+    func settingChannelIsNarrow() {
+        // Arrange
+        let original = SessionSnapshot.empty
+            .settingInput("interface-uid")
+            .settingChain(PluginChain.empty.adding(compressor))
+            .settingRunning(true)
+            .settingMonitorEnabled(false)
+
+        // Act
+        let updated = original.settingInputChannel(1)
+
+        // Assert — immutability, and no collateral damage to the chain or its settings.
+        #expect(original.inputChannel == 0)
+        #expect(updated.inputChannel == 1)
+        #expect(updated.inputUID == "interface-uid")
+        #expect(updated.chain.slots.map(\.plugin) == [compressor])
+        #expect(updated.isRunning)
+        #expect(updated.isMonitorEnabled == false)
+    }
+}

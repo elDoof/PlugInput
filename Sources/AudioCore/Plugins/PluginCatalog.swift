@@ -41,8 +41,10 @@ public enum PluginCatalog {
 
     /// Every installed AU effect, sorted for stable presentation.
     ///
-    /// This covers the user's whole plugin library: on the machine this was built for, 710 AU
-    /// components are installed against 366 VST3 bundles, with every vendor shipping both.
+    /// This covers the user's whole plugin library. Audio Units rather than VST3 is the
+    /// settled choice: AU hosting is native to `AVAudioEngine`, `requestViewController` gives
+    /// real vendor interfaces for free, and essentially every vendor ships both formats — so
+    /// the AU-only restriction costs far less library than it first appears to.
     public static func installedEffects() -> [PluginDescriptor] {
         let manager = AVAudioUnitComponentManager.shared()
 

@@ -10,6 +10,10 @@ import Foundation
 /// invariants with it.
 public struct SessionSnapshot: Codable, Equatable, Sendable {
     public let inputUID: String?
+    /// Which of that device's channels carries the microphone, zero-based. Only meaningful on
+    /// interfaces with more than one input; 0 is both the default and what every session file
+    /// written before this field existed decodes to.
+    public let inputChannel: Int
     /// The ordered effect chain, each slot carrying its own settings and bypass.
     public let chain: PluginChain
     /// Whether the engine was running when this was written, so the next launch can resume.
@@ -28,16 +32,18 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
         inputUID: String?,
         chain: PluginChain,
         isRunning: Bool,
-        isMonitorEnabled: Bool = true
+        isMonitorEnabled: Bool = true,
+        inputChannel: Int = 0
     ) {
         self.inputUID = inputUID
         self.chain = chain
         self.isRunning = isRunning
         self.isMonitorEnabled = isMonitorEnabled
+        self.inputChannel = inputChannel
     }
 
     private enum CodingKeys: String, CodingKey {
-        case inputUID, chain, isRunning, isMonitorEnabled
+        case inputUID, chain, isRunning, isMonitorEnabled, inputChannel
     }
 
     /// The single-slot format's keys. Read, never written.
@@ -63,7 +69,8 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
             inputUID: try container.decodeIfPresent(String.self, forKey: .inputUID),
             chain: try Self.decodeChain(from: decoder, container: container),
             isRunning: try container.decodeIfPresent(Bool.self, forKey: .isRunning) ?? false,
-            isMonitorEnabled: try container.decodeIfPresent(Bool.self, forKey: .isMonitorEnabled) ?? true
+            isMonitorEnabled: try container.decodeIfPresent(Bool.self, forKey: .isMonitorEnabled) ?? true,
+            inputChannel: try container.decodeIfPresent(Int.self, forKey: .inputChannel) ?? 0
         )
     }
 
@@ -83,19 +90,60 @@ public struct SessionSnapshot: Codable, Equatable, Sendable {
         return PluginChain(slots: [PluginSlot(plugin: plugin, state: state)])
     }
 
+    /// Changing the device resets the channel to the first one.
+    ///
+    /// The same reasoning as the chain's plugin/state coupling: a channel index only means
+    /// something relative to the device it was chosen on. Carrying "channel 4" from an
+    /// eight-input interface onto a built-in mono microphone would refuse every start with
+    /// "channel 4 does not exist" — a saved setting breaking a device it was never about.
     public func settingInput(_ uid: String?) -> Self {
-        Self(inputUID: uid, chain: chain, isRunning: isRunning, isMonitorEnabled: isMonitorEnabled)
+        guard uid != inputUID else { return self }
+        return Self(
+            inputUID: uid,
+            chain: chain,
+            isRunning: isRunning,
+            isMonitorEnabled: isMonitorEnabled,
+            inputChannel: 0
+        )
+    }
+
+    public func settingInputChannel(_ inputChannel: Int) -> Self {
+        Self(
+            inputUID: inputUID,
+            chain: chain,
+            isRunning: isRunning,
+            isMonitorEnabled: isMonitorEnabled,
+            inputChannel: inputChannel
+        )
     }
 
     public func settingChain(_ chain: PluginChain) -> Self {
-        Self(inputUID: inputUID, chain: chain, isRunning: isRunning, isMonitorEnabled: isMonitorEnabled)
+        Self(
+            inputUID: inputUID,
+            chain: chain,
+            isRunning: isRunning,
+            isMonitorEnabled: isMonitorEnabled,
+            inputChannel: inputChannel
+        )
     }
 
     public func settingRunning(_ isRunning: Bool) -> Self {
-        Self(inputUID: inputUID, chain: chain, isRunning: isRunning, isMonitorEnabled: isMonitorEnabled)
+        Self(
+            inputUID: inputUID,
+            chain: chain,
+            isRunning: isRunning,
+            isMonitorEnabled: isMonitorEnabled,
+            inputChannel: inputChannel
+        )
     }
 
     public func settingMonitorEnabled(_ isMonitorEnabled: Bool) -> Self {
-        Self(inputUID: inputUID, chain: chain, isRunning: isRunning, isMonitorEnabled: isMonitorEnabled)
+        Self(
+            inputUID: inputUID,
+            chain: chain,
+            isRunning: isRunning,
+            isMonitorEnabled: isMonitorEnabled,
+            inputChannel: inputChannel
+        )
     }
 }

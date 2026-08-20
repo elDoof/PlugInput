@@ -75,8 +75,12 @@ enum AggregateRegistry {
     private static func destroyUntracked(_ id: AudioObjectID) {
         let status = AudioHardwareDestroyAggregateDevice(id)
         if status != noErr {
-            FileHandle.standardError.write(
-                Data("warning: could not destroy aggregate \(id): OSStatus \(status)\n".utf8)
+            // Through the unified log, not stderr. This came across from the spike with the rest
+            // of the file, and stderr from a Finder-launched `.app` goes nowhere — so the one
+            // failure the user most needs a record of (an orphaned aggregate, gotcha #7, which
+            // then blocks every future start per gotcha #20) was the one leaving no trace.
+            EngineLog.logger.error(
+                "could not destroy aggregate \(id, privacy: .public): OSStatus \(status, privacy: .public)"
             )
         }
     }
@@ -124,12 +128,13 @@ final class AggregateDevice {
 
         // Reclaim a stale aggregate carrying this UID before asking for a new one.
         //
-        // Load-bearing since the device went public (`isPrivate: false`): a public aggregate
-        // outlives a process that exits without running its teardown — a crash, a force quit,
-        // `killall` — and CoreAudio then refuses to create another with the same UID, failing
-        // **every subsequent start** with `OSStatus 1852797029 ('nope')`. Without this the app
-        // is bricked until the user finds and deletes the device by hand, which is not a thing
-        // a user can be expected to know how to do.
+        // Load-bearing regardless of visibility. An aggregate outlives a process that exits
+        // without running its teardown — a crash, a force quit, `killall` — and CoreAudio then
+        // refuses to create another with the same UID, failing **every subsequent start** with
+        // `OSStatus 1852797029 ('nope')`. Without this the app is bricked until the user finds
+        // and deletes the device by hand, which is not something a user can be expected to know
+        // how to do. (This was first hit while the device was briefly public, which is why the
+        // note here used to say it only mattered then. It applies to the private one too.)
         Self.destroyStale(uid: uid)
 
         var createdID = AudioObjectID(0)
@@ -154,6 +159,25 @@ final class AggregateDevice {
     /// `AudioHardwareCreateAggregateDevice` report the real error rather than masking it.
     private static func destroyStale(uid: String) {
         guard let existing = try? DeviceEnumerator.device(uid: uid) else { return }
+
+        // Confirm it really is an aggregate before destroying it. Nothing else should ever
+        // claim our UID, so this should always pass — but "should" is doing a lot of work in a
+        // call that hands a device ID to `AudioHardwareDestroyAggregateDevice`, and the cost of
+        // being wrong is destroying a device belonging to something else. Cheap insurance.
+        let transport = try? propertyValue(
+            existing.id,
+            address(kAudioDevicePropertyTransportType),
+            initial: UInt32(0)
+        )
+        guard transport == kAudioDeviceTransportTypeAggregate else {
+            EngineLog.logger.error(
+                """
+                device holding \(uid, privacy: .public) is not an aggregate \
+                (transport \(transport ?? 0, privacy: .public)) — leaving it alone
+                """
+            )
+            return
+        }
 
         let status = AudioHardwareDestroyAggregateDevice(existing.id)
         AggregateRegistry.forget(existing.id)

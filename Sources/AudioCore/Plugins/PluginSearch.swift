@@ -2,8 +2,9 @@ import Foundation
 
 /// Filters the installed library down to something a person can pick from.
 ///
-/// This machine has 677 AU effects. A flat list of that length is not a chooser, it is a
-/// haystack — so search is the primary way in, not a convenience.
+/// A well-stocked machine has several hundred AU effects installed. A flat list of that
+/// length is not a chooser, it is a haystack — so search is the primary way in, not a
+/// convenience.
 public enum PluginSearch {
     /// Every whitespace-separated term must appear in the name or the manufacturer, in any
     /// order. That makes "izotope dynamics" and "dynamics izotope" both work, which matters
