@@ -111,7 +111,9 @@ if [[ -d "$DRIVER" ]]; then
     # device on the machine for a moment, which is expected and is what BlackHole's own
     # uninstaller does.
     echo "==> restarting coreaudiod"
-    sudo killall -9 coreaudiod 2>/dev/null || true
+    sudo launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null \
+        || sudo killall -9 coreaudiod 2>/dev/null \
+        || true
     sleep 3
 else
     echo "==> no driver installed at $DRIVER (skipping)"

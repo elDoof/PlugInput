@@ -36,7 +36,7 @@ readonly BUNDLE_ID="com.pluginput.driver"
 readonly DEVICE_NAME="PlugInput"
 readonly SOURCE_TAG="v0.6.1"
 readonly SOURCE_REPO="https://github.com/ExistentialAudio/BlackHole.git"
-readonly SIGN_IDENTITY="PlugInput Local Signing"
+readonly LOCAL_SIGN_IDENTITY="PlugInput Local Signing"
 readonly HAL_DIR="/Library/Audio/Plug-Ins/HAL"
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -64,20 +64,40 @@ git -C "$SRC" checkout --quiet "$SOURCE_TAG"
 
 # --- signing -----------------------------------------------------------------------------
 
-# Same reasoning as make-app.sh: a stable leaf keeps the code requirement stable. A HAL driver
-# needs no TCC grant, so ad-hoc is a genuine fallback here rather than a trap — a self-signed,
-# un-notarized driver does load, which this project verified rather than assumed.
+# Identity selection, in the same priority order make-app.sh uses — and it has to be the same,
+# because notarization validates *every* nested Mach-O in the package. A driver signed with the
+# local leaf while the app carries a Developer ID passes every check on this machine and is then
+# rejected by Apple minutes later, with nothing local having warned about it. This used to be a
+# hardcoded constant with no Developer ID path at all, which made shipping impossible without
+# editing the script.
+#
+#   1. $PLUGINPUT_SIGN_IDENTITY, so a release build can name an identity explicitly
+#   2. a "Developer ID Application" identity, if the machine has one
+#   3. the self-signed local leaf
+#   4. ad-hoc — a genuine fallback here rather than a trap, unlike in the app: a HAL driver
+#      needs no TCC grant, and a self-signed, un-notarized driver does load, which this project
+#      verified rather than assumed. It cannot be notarized, though.
+#
 # Captured rather than piped: `security ... | grep -q` reports failure under `set -o pipefail`
 # when grep exits first and `security` takes a SIGPIPE, which would silently sign the driver
 # ad-hoc despite the identity being present.
 IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
-if grep -q "$SIGN_IDENTITY" <<< "$IDENTITIES"; then
-    SIGN_ARGS=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$SIGN_IDENTITY" DEVELOPMENT_TEAM="")
-    echo "==> signing with '$SIGN_IDENTITY'"
-else
-    SIGN_ARGS=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="")
-    echo "==> '$SIGN_IDENTITY' not found; signing ad-hoc"
+
+SIGN_AS="${PLUGINPUT_SIGN_IDENTITY:-}"
+if [[ -z "$SIGN_AS" ]]; then
+    SIGN_AS="$(sed -n 's/.*"\(Developer ID Application:.*\)"$/\1/p' <<< "$IDENTITIES" | head -1)"
 fi
+if [[ -z "$SIGN_AS" ]] && grep -q "$LOCAL_SIGN_IDENTITY" <<< "$IDENTITIES"; then
+    SIGN_AS="$LOCAL_SIGN_IDENTITY"
+fi
+if [[ -z "$SIGN_AS" ]]; then
+    echo "==> no signing identity found; signing ad-hoc (cannot be notarized)"
+    SIGN_AS="-"
+else
+    echo "==> signing with '$SIGN_AS'"
+fi
+readonly SIGN_AS
+SIGN_ARGS=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$SIGN_AS" DEVELOPMENT_TEAM="")
 readonly SIGN_ARGS
 
 # --- build -------------------------------------------------------------------------------
@@ -124,13 +144,18 @@ fi
 
 # --- install -----------------------------------------------------------------------------
 
-# coreaudiod must be restarted for a HAL plug-in to load; there is no lighter-weight signal.
-# This blips every audio device on the machine for a moment, which is expected, and is exactly
+# Restarting coreaudiod is how a HAL plug-in gets picked up; there is no lighter-weight signal
+# and no API to ask for one. `launchctl kickstart -k` rather than `killall -9`, because a clean
+# restart is markedly less likely to make macOS re-elect a default device — and the device it
+# elects is the loopback that was just installed, which leaves every app following the system
+# default listening to silence. `killall -9` is kept as a fallback for anything that refuses.
+# This blips every audio device on the machine for a moment either way, which is expected and is
 # what BlackHole's own install instructions do.
 echo "==> installing to $HAL_DIR (requires an administrator password)"
 sudo rm -rf "${HAL_DIR:?}/$DRIVER_NAME.driver"
 sudo cp -R "$BUNDLE" "$HAL_DIR/"
-sudo killall -9 coreaudiod
+sudo launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null \
+    || sudo killall -9 coreaudiod
 
 echo "==> waiting for coreaudiod"
 sleep 3

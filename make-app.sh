@@ -21,14 +21,40 @@ VERSION="$(tr -d '[:space:]' < VERSION)"
 BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 echo "==> Version $VERSION (build $BUILD)"
 
-echo "==> Building ($CONFIG)"
-swift build -c "$CONFIG"
-BINARY="$(swift build -c "$CONFIG" --show-bin-path)/PlugInput"
+# Release builds are universal; debug builds are native, because a second slice doubles the
+# compile for an iteration nobody ships.
+#
+# This is not optional for a public release. The driver has always been universal (xcodebuild
+# defaults to it), the installer's distribution.xml declares hostArchitectures="arm64,x86_64",
+# and the README promises "Apple silicon or Intel" — but `swift build` defaults to the host
+# architecture alone, so every build so far was arm64-only. An Intel Mac would have been
+# allowed to install a package whose app could not run natively on it.
+ARCH_ARGS=()
+if [[ "$CONFIG" == "release" ]]; then
+    ARCH_ARGS=(--arch arm64 --arch x86_64)
+fi
+
+echo "==> Building ($CONFIG${ARCH_ARGS:+, universal})"
+swift build -c "$CONFIG" "${ARCH_ARGS[@]}"
+BINARY="$(swift build -c "$CONFIG" "${ARCH_ARGS[@]}" --show-bin-path)/PlugInput"
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/PlugInput"
+
+# Verified, not assumed — the recurring lesson here. A release build that quietly produced one
+# slice would ship an installer promising Intel support it cannot honour.
+if [[ "$CONFIG" == "release" ]]; then
+    SLICES="$(lipo -archs "$APP/Contents/MacOS/PlugInput" 2>/dev/null || echo "")"
+    echo "==> Architectures: ${SLICES:-unknown}"
+    for want in arm64 x86_64; do
+        if [[ "$SLICES" != *"$want"* ]]; then
+            echo "!!! release build is missing the $want slice (got: ${SLICES:-none})." >&2
+            exit 1
+        fi
+    done
+fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -65,6 +91,19 @@ cat > "$ENTITLEMENTS" <<PLIST
       /Library/Audio/Plug-Ins/Components at all.
     -->
     <key>com.apple.security.cs.disable-library-validation</key><true/>
+    <!--
+      Equally mandatory, and for a different reason than the line above (see gotcha #23).
+      Copy-protected plugins - UAD, Waves, Slate, anything wrapped in PACE/iLok - decrypt
+      their own code into memory at load time and execute it. Under the hardened runtime the
+      kernel hashes executable pages on fault-in, finds the rewritten page does not match the
+      signature, and SIGKILLs the *host* with CODESIGNING "Invalid Page". Not a catchable
+      error, not a plugin-level failure: the whole app dies mid-dlopen.
+      disable-library-validation does not cover this - it governs who signed the library, not
+      whether its pages may be rewritten after mapping.
+      Empirical check, not a guess: Ableton Live 12, which hosts these plugins on this machine,
+      ships exactly these two cs.* entitlements and no others.
+    -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
 </dict>
 </plist>
 PLIST
@@ -126,7 +165,7 @@ fi
 # way to find out before shipping that it does not stop third-party Audio Units from loading.
 # (It does not, because disable-library-validation is in the entitlements above — but this
 # project's whole history is layers reporting success while producing silence, so it is
-# measured, not assumed. See RELEASE.md.)
+# measured, not assumed.)
 codesign --force --sign "$SIGN_AS" --options runtime \
     --entitlements "$ENTITLEMENTS" "$APP" 2>&1 | sed 's/^/    /'
 rm -f "$ENTITLEMENTS"
