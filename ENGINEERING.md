@@ -15,6 +15,10 @@ orphaned aggregates, a three-plugin chain wiring in the logged order (duplicates
 pre-chain `session.json` migrating with its state intact, the monitor toggle affecting only the
 monitor leg, and the exception barrier catching a real double-tap raise.
 
+The **graph/hardware sample-rate mismatch is fixed** (gotcha #27): all six format numbers now
+agree at the hardware rate, and the full UAD + SSL chain measures **−30.9 dBFS broadband** from
+a separate process against a −120.0 dBFS control.
+
 **Not verified from here:** the click-level chain UI — adding, reordering with ↑/↓, toggling
 bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
 That pass is still worth doing; see "Working on the audio path".
@@ -371,6 +375,39 @@ silence rather than an error.
     `-10875` (gotcha #19), so the read-back proves less here than it appears to. And a channel
     index only means something on the device it was chosen on: `settingInput` resets it, and
     `refresh()` clamps it, or a saved channel outlives its interface and refuses every start.
+27. **A node's graph-side format is frozen at materialisation, so "the device format" has to be
+    read from the *hardware* face.** This is gotcha #4 again, and following it in name while
+    breaking it in fact cost a release cycle. `buildGraph` read `outputNode.inputFormat` and
+    `inputNode.outputFormat` — the **graph** faces — and called one of them `deviceFormat`.
+    An `AVAudioEngine` node configures itself against whatever device is current the moment it
+    materialises, which is the *system default*, and pointing
+    `kAudioOutputUnitProperty_CurrentDevice` at the aggregate afterwards moves only the hardware
+    face. So on a machine whose default output ran at 44.1kHz while the microphone ran at 48kHz,
+    the whole graph ran at 44.1kHz and the input arrived as **exact digital silence** — with
+    `engine.start()` returning success, the meter reading 0.0, and the microphone coming back
+    only when the user switched input devices and back, which rebuilds the graph and lands on
+    the right rate by accident.
+    Measured, from a standalone program outside the app so the app could not be the cause:
+
+    ```
+    after binding to a 48kHz device        after connecting at the hardware format
+      inputNode.input   2ch @ 48000          inputNode.input   2ch @ 48000
+      inputNode.output  2ch @ 44100  <-      inputNode.output  2ch @ 48000
+      outputNode.input  2ch @ 44100  <-      outputNode.input  2ch @ 48000
+      outputNode.output 2ch @ 48000          outputNode.output 2ch @ 48000
+    ```
+
+    **Connecting at the hardware format is the only thing that moves the graph face.** Spinning
+    the runloop so the configuration-change notification is delivered, `engine.reset()`, writing
+    `CurrentDevice` a second time, and replacing the whole `AVAudioEngine` were each measured to
+    change nothing. A tap installed at the stale rate reads −120.0 dBFS where the same signal at
+    the hardware rate reads −19.0.
+    Two consequences worth keeping. The chain is now wired at the microphone's real channel
+    count, so a mono mic runs a mono chain — the old graph face claimed 2 channels for a
+    1-channel device. And `Spike/`'s listener had the identical bug, which made the project's
+    own verification tool report silence for a working app; it now taps at
+    `inputNode.inputFormat`. **The instrument was wrong at the same time as the thing it
+    measured** — when a measurement disagrees with the app's own log, suspect both.
 
 ## Persistence
 

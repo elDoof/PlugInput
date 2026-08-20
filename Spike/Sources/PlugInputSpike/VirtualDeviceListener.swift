@@ -37,7 +37,15 @@ final class VirtualDeviceListener: @unchecked Sendable {
         try EngineDeviceBinding.bind(deviceID: deviceID, on: engine, sides: .input)
 
         let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
+        // The **hardware** face, not `outputFormat`. A node materialises against whatever device
+        // was current at the time — the system default — and binding it to `deviceID` afterwards
+        // updates only this face. `outputFormat` keeps the default device's rate, and a tap
+        // installed at that stale rate delivers **exact digital silence** while every call
+        // returns success: measured at -120.0 dBFS against -19.0 dBFS for the same signal read
+        // at the hardware format. Installing the tap at this format is also what pulls the
+        // node's graph face across, which is why no connection is needed to correct it — and a
+        // connection is not an option, see the note on `mainMixerNode` below.
+        let inputFormat = inputNode.inputFormat(forBus: 0)
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
             throw SpikeError.message("listener input format is \(inputFormat) — device not readable")
         }

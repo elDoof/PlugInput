@@ -45,26 +45,11 @@ public final class AudioEngineController: @unchecked Sendable {
     // and pointing at an aggregate that has already been destroyed, and no graph state carries
     // across a start.
     //
-    // OPEN BUG, do not assume this is solved. The engine runs its graph at a different sample
-    // rate than the hardware, and the input then arrives as exact digital silence — no error,
-    // a meter reading 0.0, and a microphone that only comes back if the user switches input
-    // devices and switches back, which forces a rebuild by accident. Measured:
-    //
-    //     inputNode.input   1ch @ 48000   <- real hardware
-    //     inputNode.output  2ch @ 44100   <- graph
-    //     outputNode.input  2ch @ 44100   <- graph
-    //     outputNode.output 2ch @ 48000   <- real hardware
-    //     aggregate nominal      48000
-    //
-    // Ruled out: format caching across starts. A brand-new engine reports 44.1kHz just the
-    // same, so the engine adopts the *system default output's* rate when its nodes first
-    // materialise and never re-reads it once `kAudioOutputUnitProperty_CurrentDevice` changes.
-    //
-    // Next hypothesis: `buildGraph` connects using the graph-side formats
-    // (`outputNode.inputFormat`, `inputNode.outputFormat`) while calling one of them
-    // `deviceFormat`. Gotcha #4 says connect at the *device* format, which is the hardware side
-    // — `outputNode.outputFormat` / `inputNode.inputFormat`. Worth chasing alongside the second
-    // oddity above: the node reports 2 channels for a mono microphone.
+    // A node's graph-side format is fixed when the node materialises, against whatever device
+    // was current at that moment — and replacing the engine does not change that, because the
+    // device is still bound after the fact. This was a silent-microphone bug for a release
+    // cycle; the fix lives in `buildGraph`, which connects at the hardware faces. Do not
+    // "simplify" those connections back to `outputNode.inputFormat` / `inputNode.outputFormat`.
     private var engine = AVAudioEngine()
     private var aggregate: AggregateDevice?
     /// The chain's units, in signal order. Held so teardown can detach every one of them —
@@ -427,33 +412,33 @@ public final class AudioEngineController: @unchecked Sendable {
         layout: AggregateChannelLayout,
         aggregateID: AudioObjectID
     ) throws {
-        let deviceFormat = engine.outputNode.inputFormat(forBus: 0)
         let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
         // Barriered like the rest: reaching for the main mixer is not a plain property read,
         // it lazily attaches a node.
         let mixer = try withGraphBarrier("resolving main mixer") { engine.mainMixerNode }
 
-        // Every face of every node, plus what the hardware actually says. The graph running at a
-        // different rate than the device is silent, not loud — so these six numbers agreeing is
-        // the thing worth being able to check at a glance.
-        let inputNodeHardware = inputNode.inputFormat(forBus: 0)
-        let outputNodeHardware = engine.outputNode.outputFormat(forBus: 0)
-        let hardwareRate = (try? SampleRate.current(aggregateID)) ?? 0
-        EngineLog.logger.info(
-            """
-            formats before start — \
-            inputNode.input \(inputNodeHardware.channelCount, privacy: .public)ch @ \
-            \(inputNodeHardware.sampleRate, privacy: .public)Hz, \
-            inputNode.output \(inputFormat.channelCount, privacy: .public)ch @ \
-            \(inputFormat.sampleRate, privacy: .public)Hz, \
-            outputNode.input \(deviceFormat.channelCount, privacy: .public)ch @ \
-            \(deviceFormat.sampleRate, privacy: .public)Hz, \
-            outputNode.output \(outputNodeHardware.channelCount, privacy: .public)ch @ \
-            \(outputNodeHardware.sampleRate, privacy: .public)Hz, \
-            aggregate nominal \(hardwareRate, privacy: .public)Hz
-            """
-        )
+        // Connect at each node's **hardware** face — `outputNode.outputFormat` and
+        // `inputNode.inputFormat` — never at its graph face. This is gotcha #4, and reading the
+        // graph face instead is what made it silently wrong for a release cycle.
+        //
+        // A node materialises against whatever device was current at that moment, which is the
+        // system default, and pointing `kAudioOutputUnitProperty_CurrentDevice` at the aggregate
+        // afterwards updates only the hardware face. The graph face keeps the *old* device's
+        // rate — so with a 44.1kHz default output and a 48kHz microphone the graph ran at
+        // 44.1kHz, the input arrived as exact digital silence, and `engine.start()` returned
+        // success anyway. Connecting at the hardware format is the only thing that pulls the
+        // graph face across: spinning the runloop for the configuration-change notification,
+        // `engine.reset()`, and writing `CurrentDevice` a second time were each measured to do
+        // nothing at all.
+        let outputFormat = engine.outputNode.outputFormat(forBus: 0)
+
+        // The output side is wired first, so the mixer has already adopted the hardware rate
+        // before anything is connected into it.
+        try withGraphBarrier("connecting mixer to output") {
+            engine.connect(mixer, to: engine.outputNode, format: outputFormat)
+        }
+
+        let inputFormat = inputNode.inputFormat(forBus: 0)
 
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
             throw AudioCoreError.message(
@@ -496,10 +481,31 @@ public final class AudioEngineController: @unchecked Sendable {
             engine.connect(source, to: mixer, format: inputFormat)
         }
 
-        try withGraphBarrier("connecting mixer to output") {
-            engine.connect(mixer, to: engine.outputNode, format: deviceFormat)
-        }
-        try installInputTap(on: inputNode, format: inputFormat)
+        // Read back rather than reused: the tap's format has to match what the node actually
+        // produces, and `installTap` signals a mismatch by raising. Connecting above is what
+        // moved the graph face onto the hardware rate, so this is the proof it moved.
+        let tapFormat = inputNode.outputFormat(forBus: 0)
+        try installInputTap(on: inputNode, format: tapFormat)
+
+        // Every face of every node, plus what the hardware actually says, logged once the graph
+        // is fully wired. A graph running at a different rate than the device is silent, not
+        // loud, and start() reports success either way — so these six numbers agreeing is the
+        // one check that distinguishes a working start from a silent one at a glance.
+        let hardwareRate = (try? SampleRate.current(aggregateID)) ?? 0
+        let outputGraphRate = engine.outputNode.inputFormat(forBus: 0).sampleRate
+        EngineLog.logger.info(
+            """
+            formats before start — \
+            inputNode.input \(inputFormat.channelCount, privacy: .public)ch @ \
+            \(inputFormat.sampleRate, privacy: .public)Hz, \
+            inputNode.output \(tapFormat.channelCount, privacy: .public)ch @ \
+            \(tapFormat.sampleRate, privacy: .public)Hz, \
+            outputNode.input \(outputGraphRate, privacy: .public)Hz, \
+            outputNode.output \(outputFormat.channelCount, privacy: .public)ch @ \
+            \(outputFormat.sampleRate, privacy: .public)Hz, \
+            aggregate nominal \(hardwareRate, privacy: .public)Hz
+            """
+        )
 
         try withGraphBarrier("preparing engine") { engine.prepare() }
         // Barriered as well as `try`-ed. `start()` throws properly for the failures it
@@ -516,8 +522,8 @@ public final class AudioEngineController: @unchecked Sendable {
             """
             engine started: input \(inputFormat.channelCount, privacy: .public)ch @ \
             \(inputFormat.sampleRate, privacy: .public)Hz, device \
-            \(deviceFormat.channelCount, privacy: .public)ch @ \
-            \(deviceFormat.sampleRate, privacy: .public)Hz, \
+            \(outputFormat.channelCount, privacy: .public)ch @ \
+            \(outputFormat.sampleRate, privacy: .public)Hz, \
             chain \(Self.describe(effects), privacy: .public)
             """
         )
