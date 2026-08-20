@@ -108,14 +108,16 @@ mkdir -p "$OUT/root-app/Applications" "$OUT/root-driver/Library/Audio/Plug-Ins/H
 cp -R "$APP" "$OUT/root-app/Applications/"
 cp -R "$DRIVER_SRC" "$OUT/root-driver/Library/Audio/Plug-Ins/HAL/"
 
-# Ship the uninstaller inside the app bundle.
-#
-# README tells people to run ./uninstall.sh, which somebody who installed a .pkg does not have
-# — the same "instructions written for the one machine this was built on" bug already fixed for
-# the driver-missing message. Inside Contents/Resources it travels with the app and survives
-# being dragged around, and the app can point at its own copy by absolute path.
-cp uninstall.sh "$OUT/root-app/Applications/PlugInput.app/Contents/Resources/uninstall.sh"
-chmod +x "$OUT/root-app/Applications/PlugInput.app/Contents/Resources/uninstall.sh"
+# The uninstaller travels inside the app bundle, but it is put there by make-app.sh *before*
+# signing. Copying it in here — into an already-signed bundle — invalidated the code signature
+# and got the package rejected by Apple with "The signature of the binary is invalid", while
+# every local `codesign --strict` check still passed. Do not add anything to the staged bundle
+# below; add it in make-app.sh ahead of its `codesign`.
+if [[ ! -x "$OUT/root-app/Applications/PlugInput.app/Contents/Resources/uninstall.sh" ]]; then
+    echo "!!! the staged app has no executable Contents/Resources/uninstall.sh." >&2
+    echo "    make-app.sh is meant to install it before signing. Refusing." >&2
+    exit 1
+fi
 
 # --- postinstall ----------------------------------------------------------------------------
 
@@ -258,7 +260,20 @@ if $NOTARIZE; then
     echo "==> Submitting to Apple (this takes minutes, not seconds)"
     # Credentials come from a stored profile so no secret is ever written into this repo:
     #   xcrun notarytool store-credentials pluginput --apple-id ... --team-id ... --password ...
-    xcrun notarytool submit "$FINAL" --keychain-profile "pluginput" --wait
+    #
+    # `notarytool submit --wait` exits 0 for a *rejected* submission — it reports that the
+    # submission itself succeeded, not that Apple accepted the build. Without this check the
+    # first sign of trouble is `stapler` failing with "Record not found", which names neither
+    # the cause nor the file. Read the status and fetch Apple's reasons instead.
+    SUBMIT_OUT="$(xcrun notarytool submit "$FINAL" --keychain-profile "pluginput" --wait 2>&1 | tee /dev/stderr)"
+    SUBMISSION_ID="$(sed -n 's/^ *id: *//p' <<< "$SUBMIT_OUT" | head -1)"
+    if ! grep -qE '^ *status: Accepted' <<< "$SUBMIT_OUT"; then
+        echo >&2
+        echo "!!! Apple did not accept this build. Its reasons:" >&2
+        [[ -n "$SUBMISSION_ID" ]] &&
+            xcrun notarytool log "$SUBMISSION_ID" --keychain-profile "pluginput" >&2 2>&1
+        exit 1
+    fi
 
     echo "==> Stapling"
     xcrun stapler staple "$FINAL"

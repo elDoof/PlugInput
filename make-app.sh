@@ -43,6 +43,15 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/PlugInput"
 
+# The uninstaller ships inside the bundle, and it is copied in HERE — before signing — on
+# purpose. It used to be added by make-pkg.sh, which runs after this script has already signed
+# the app, and dropping a file into Contents/Resources invalidates the bundle seal: every local
+# check still passed (`codesign --strict` verifies the bundle on disk, which was fine) and Apple
+# rejected the upload minutes later with "The signature of the binary is invalid". Anything
+# added to the bundle has to be added before the `codesign` at the end of this file.
+cp "$(dirname "$0")/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
+chmod +x "$APP/Contents/Resources/uninstall.sh"
+
 # Verified, not assumed — the recurring lesson here. A release build that quietly produced one
 # slice would ship an installer promising Intel support it cannot honour.
 if [[ "$CONFIG" == "release" ]]; then
@@ -166,7 +175,11 @@ fi
 # (It does not, because disable-library-validation is in the entitlements above — but this
 # project's whole history is layers reporting success while producing silence, so it is
 # measured, not assumed.)
-codesign --force --sign "$SIGN_AS" --options runtime \
+# --timestamp is required for notarization: Apple rejects a signature without a secure
+# timestamp. It cannot be used with an ad-hoc signature, which has nowhere to put one.
+TIMESTAMP_ARGS=(--timestamp)
+[[ "$SIGN_AS" == "-" ]] && TIMESTAMP_ARGS=()
+codesign --force --sign "$SIGN_AS" --options runtime "${TIMESTAMP_ARGS[@]}" \
     --entitlements "$ENTITLEMENTS" "$APP" 2>&1 | sed 's/^/    /'
 rm -f "$ENTITLEMENTS"
 

@@ -98,6 +98,11 @@ else
 fi
 readonly SIGN_AS
 SIGN_ARGS=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$SIGN_AS" DEVELOPMENT_TEAM="")
+# Notarization rejects a signature with no secure timestamp, and xcodebuild does not add one on
+# its own — the driver passed every local check and Apple returned "The signature does not
+# include a secure timestamp" for both architectures. An ad-hoc signature cannot carry one, so
+# this is only added for a real identity.
+[[ "$SIGN_AS" != "-" ]] && SIGN_ARGS+=(OTHER_CODE_SIGN_FLAGS="--timestamp")
 readonly SIGN_ARGS
 
 # --- build -------------------------------------------------------------------------------
