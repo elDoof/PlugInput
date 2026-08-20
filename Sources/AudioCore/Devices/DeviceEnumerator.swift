@@ -80,6 +80,18 @@ public enum DeviceEnumerator {
     }
 }
 
+/// Reads a device's nominal sample rate.
+///
+/// Read-only on purpose. Writing it would drag the user's hardware to a rate chosen by this
+/// app, which is the mistake gotcha #24 is about — the app follows the device, never the
+/// reverse. What this is *for* is catching the engine running its graph at a different rate
+/// than the hardware, which produces silence rather than an error.
+enum SampleRate {
+    static func current(_ deviceID: AudioObjectID) throws -> Double {
+        try propertyValue(deviceID, address(kAudioDevicePropertyNominalSampleRate), initial: Double(0))
+    }
+}
+
 /// Reads and writes the hardware buffer size, which sets the floor on round-trip latency.
 enum BufferSize {
     static func current(_ deviceID: AudioObjectID) throws -> UInt32 {

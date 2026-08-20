@@ -37,7 +37,35 @@ public final class AudioEngineController: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.pluginput.engine")
 
     // Touched only on `queue`.
-    private let engine = AVAudioEngine()
+    //
+    // A `var`, and replaced on every start — for engine hygiene, **not** as a fix for the
+    // sample-rate bug described below. It was tried as that fix and did not work.
+    //
+    // What it does buy: the previous start's AUHALs are disposed rather than left initialised
+    // and pointing at an aggregate that has already been destroyed, and no graph state carries
+    // across a start.
+    //
+    // OPEN BUG, do not assume this is solved. The engine runs its graph at a different sample
+    // rate than the hardware, and the input then arrives as exact digital silence — no error,
+    // a meter reading 0.0, and a microphone that only comes back if the user switches input
+    // devices and switches back, which forces a rebuild by accident. Measured:
+    //
+    //     inputNode.input   1ch @ 48000   <- real hardware
+    //     inputNode.output  2ch @ 44100   <- graph
+    //     outputNode.input  2ch @ 44100   <- graph
+    //     outputNode.output 2ch @ 48000   <- real hardware
+    //     aggregate nominal      48000
+    //
+    // Ruled out: format caching across starts. A brand-new engine reports 44.1kHz just the
+    // same, so the engine adopts the *system default output's* rate when its nodes first
+    // materialise and never re-reads it once `kAudioOutputUnitProperty_CurrentDevice` changes.
+    //
+    // Next hypothesis: `buildGraph` connects using the graph-side formats
+    // (`outputNode.inputFormat`, `inputNode.outputFormat`) while calling one of them
+    // `deviceFormat`. Gotcha #4 says connect at the *device* format, which is the hardware side
+    // — `outputNode.outputFormat` / `inputNode.inputFormat`. Worth chasing alongside the second
+    // oddity above: the node reports 2 channels for a mono microphone.
+    private var engine = AVAudioEngine()
     private var aggregate: AggregateDevice?
     /// The chain's units, in signal order. Held so teardown can detach every one of them —
     /// a unit left attached to a stopped engine is a leak the next start inherits.
@@ -80,6 +108,12 @@ public final class AudioEngineController: @unchecked Sendable {
         // Registered here rather than at start, because the notification can arrive during the
         // teardown that follows one. `handleConfigurationChange` hops to `queue` and re-checks
         // the state there, which is what makes that safe.
+        observeConfigurationChanges()
+    }
+
+    /// Watches the *current* engine. Re-registered whenever the engine is replaced, because the
+    /// notification is scoped to the instance that posts it.
+    private func observeConfigurationChanges() {
         configurationObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
@@ -87,6 +121,17 @@ public final class AudioEngineController: @unchecked Sendable {
         ) { [weak self] _ in
             self?.handleConfigurationChange()
         }
+    }
+
+    /// Swaps in a clean engine. Call only after `stopOnQueue`, which detaches the effect nodes —
+    /// a node still attached to the discarded engine cannot be attached to the new one.
+    private func replaceEngine() {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+        }
+        engine = AVAudioEngine()
+        isTapInstalled = false
+        observeConfigurationChanges()
     }
 
     deinit {
@@ -268,6 +313,7 @@ public final class AudioEngineController: @unchecked Sendable {
     private func startOnQueue(_ request: StartRequest) throws {
         let (input, monitor, virtual) = (request.input, request.monitor, request.virtual)
         stopOnQueue()
+        replaceEngine()
 
         let subDevices = Self.orderedSubDevices(input: input, virtual: virtual, monitor: monitor)
 
@@ -299,7 +345,8 @@ public final class AudioEngineController: @unchecked Sendable {
                 effects: request.effects.units,
                 virtual: virtual,
                 monitor: monitor,
-                layout: device.layout
+                layout: device.layout,
+                aggregateID: device.id
             )
 
             publish(state: .running)
@@ -377,7 +424,8 @@ public final class AudioEngineController: @unchecked Sendable {
         effects: [AVAudioUnit],
         virtual: AudioDevice,
         monitor: AudioDevice?,
-        layout: AggregateChannelLayout
+        layout: AggregateChannelLayout,
+        aggregateID: AudioObjectID
     ) throws {
         let deviceFormat = engine.outputNode.inputFormat(forBus: 0)
         let inputNode = engine.inputNode
@@ -386,15 +434,24 @@ public final class AudioEngineController: @unchecked Sendable {
         // it lazily attaches a node.
         let mixer = try withGraphBarrier("resolving main mixer") { engine.mainMixerNode }
 
+        // Every face of every node, plus what the hardware actually says. The graph running at a
+        // different rate than the device is silent, not loud — so these six numbers agreeing is
+        // the thing worth being able to check at a glance.
+        let inputNodeHardware = inputNode.inputFormat(forBus: 0)
+        let outputNodeHardware = engine.outputNode.outputFormat(forBus: 0)
+        let hardwareRate = (try? SampleRate.current(aggregateID)) ?? 0
         EngineLog.logger.info(
             """
-            formats before start — input \(inputFormat.channelCount, privacy: .public)ch @ \
+            formats before start — \
+            inputNode.input \(inputNodeHardware.channelCount, privacy: .public)ch @ \
+            \(inputNodeHardware.sampleRate, privacy: .public)Hz, \
+            inputNode.output \(inputFormat.channelCount, privacy: .public)ch @ \
             \(inputFormat.sampleRate, privacy: .public)Hz, \
             outputNode.input \(deviceFormat.channelCount, privacy: .public)ch @ \
             \(deviceFormat.sampleRate, privacy: .public)Hz, \
-            outputNode.output \
-            \(self.engine.outputNode.outputFormat(forBus: 0).channelCount, privacy: .public)ch @ \
-            \(self.engine.outputNode.outputFormat(forBus: 0).sampleRate, privacy: .public)Hz
+            outputNode.output \(outputNodeHardware.channelCount, privacy: .public)ch @ \
+            \(outputNodeHardware.sampleRate, privacy: .public)Hz, \
+            aggregate nominal \(hardwareRate, privacy: .public)Hz
             """
         )
 
