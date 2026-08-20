@@ -4,20 +4,25 @@ A macOS menu bar app that puts audio plugins on your live microphone, so you can
 compressor (or anything else) on your voice without opening a DAW — and have Zoom / Discord /
 OBS see the processed signal as a microphone.
 
-## Status: working and in daily use
+## Status: v0.9.0 released publicly, 2026-08-19
+
+Shipped: <https://github.com/elDoof/PlugInput/releases/tag/v0.9.0>. The repository is public,
+the `.pkg` is signed with a Developer ID and notarized, and the published asset was verified as
+a user receives it — downloaded from the release URL, `spctl` reporting
+`accepted / source=Notarized Developer ID`, the stapled ticket validating offline, and SHA-256
+matching the local build.
 
 The routing is measured, not assumed: **mic → effect chain → private aggregate → PlugInput**,
-read from a separate process at **−33.4 dBFS broadband** against a −120.0 dBFS silence control,
-with the app's own log line reading `virtual PlugInput`. The renamed HAL driver measures
-**−14.0 dBFS bit-exact** on the two-process tone test (gotcha #22). Also verified: the unit
+read from a separate process at **−31.3 dBFS broadband** through a UAD + SSL chain on the
+notarized build, against a −120.0 dBFS silence control, with the app's own log line reading
+`virtual PlugInput`. Also verified: the unit
 tests, `PlugInput.app` launching and staying resident, several hundred AU effects discovered, no
 orphaned aggregates, a three-plugin chain wiring in the logged order (duplicates included), a
 pre-chain `session.json` migrating with its state intact, the monitor toggle affecting only the
 monitor leg, and the exception barrier catching a real double-tap raise.
 
-The **graph/hardware sample-rate mismatch is fixed** (gotcha #27): all six format numbers now
-agree at the hardware rate, and the full UAD + SSL chain measures **−30.9 dBFS broadband** from
-a separate process against a −120.0 dBFS control.
+The **graph/hardware sample-rate mismatch is fixed** (gotcha #27) — all six format numbers now
+agree at the hardware rate. It was the last release blocker.
 
 **Not verified from here:** the click-level chain UI — adding, reordering with ↑/↓, toggling
 bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
@@ -29,10 +34,15 @@ Reproduce it with the app running and a plugin loaded:
 cd Spike && ./.build/debug/PlugInputSpike listen 4 PlugInput
 ```
 
-Broadband well above −120.0 dBFS is the proof. Two traps in reading that number: ignore the
+Broadband well above −120.0 dBFS is the proof. Three traps in reading that number. Ignore the
 harness's `RESULT: FAIL`, which looks for the Phase 0 440Hz tone that a microphone does not
-emit; and **give the engine a few seconds after launch** — listening too early reads −120.0 and
-looks exactly like a real failure.
+emit. **Give the engine a few seconds after launch** — listening too early reads −120.0 and
+looks exactly like a real failure. And **do not read it back-to-back**: opening and closing the
+virtual device repeatedly leaves later readers on exact digital silence for tens of seconds
+before it recovers on its own, which is the driver's "is anything writing?" re-sync (gotcha #22)
+and not a fault in the app. A run of −120.0 readings that ends in signal with nothing changed is
+this, every time. Cross-check against the app's own `input peak` line before believing a
+failure: peak non-zero plus listener silent means the *reader* is out of sync.
 
 ### Version control
 
@@ -144,8 +154,16 @@ cd Spike && swift build
 ./.build/debug/PlugInputSpike listen 6              # expect PASS at -14.0 dBFS
 ```
 
-−14.0 dBFS is bit-exact against the emitted amplitude. Re-run this if routing ever regresses;
-it isolates the audio path from the UI completely.
+**The −14.0 dBFS figure does not hold for `tone` mode, and chasing the discrepancy wastes a
+session.** The tone is mono at 0.2 amplitude (−13.98 dBFS) and `tone` mode feeds it through
+`mainMixerNode`, which equal-power pans mono to stereo: −3.01 dB, so the honest expectation is
+**−17.0 dBFS**. −14.0 is bit-exact only where no mixer sits in the path. The `tone` emitter is
+also **intermittent** — the identical graph configuration was measured delivering −17.0 and
+−120.0 on consecutive runs — so a single silent result from it proves nothing. It is Phase 0
+scaffolding and is not on the release path; the check that actually settles things is the
+`listen` mode against the running app.
+
+Re-run this if routing ever regresses; it isolates the audio path from the UI completely.
 
 ## Gotchas that cost real debugging time
 
@@ -408,6 +426,27 @@ silence rather than an error.
     own verification tool report silence for a working app; it now taps at
     `inputNode.inputFormat`. **The instrument was wrong at the same time as the thing it
     measured** — when a measurement disagrees with the app's own log, suspect both.
+28. **Two notarization failures that every local check passes.** Both were found only by Apple
+    rejecting an upload, which is the slowest possible feedback loop, so they are written down
+    rather than left to be rediscovered.
+    **Anything added to the bundle after signing breaks the seal.** `make-pkg.sh` used to copy
+    `uninstall.sh` into `Contents/Resources` of an app `make-app.sh` had already signed. Dropping
+    a file into a signed bundle invalidates its `_CodeSignature/CodeResources` seal — but
+    `codesign -vvv --strict` verifies *the bundle on disk*, which was untouched and passed, as
+    did `spctl`. Apple returned "The signature of the binary is invalid" for both architectures.
+    The uninstaller is now installed by `make-app.sh` before its `codesign`, and `make-pkg.sh`
+    refuses to build if the staged bundle does not already carry it. **Add nothing to the bundle
+    after signing.**
+    **`xcodebuild` does not add a secure timestamp.** The driver signed cleanly, verified
+    locally, carried the hardened runtime, and was rejected with "The signature does not include
+    a secure timestamp". It needs `OTHER_CODE_SIGN_FLAGS="--timestamp"`, and only for a real
+    identity — an ad-hoc signature has nowhere to put one. The app passes `--timestamp`
+    explicitly for the same reason rather than relying on a default.
+    **And `notarytool submit --wait` exits 0 on a rejected submission** — it reports that the
+    *upload* succeeded, not that Apple accepted the build. Without an explicit status check the
+    first symptom is `stapler` failing with "Record not found", which names neither the cause nor
+    the file. `make-pkg.sh` now reads the status and prints `notarytool log` on rejection, which
+    is where the two errors above actually came from.
 
 ## Persistence
 
@@ -442,9 +481,9 @@ whether the engine actually started. Delete it to reset the app.
 
 ## Next steps
 
-- **Distribution is settled, and two of the decisions are not worth relitigating.**
+- **Distribution is DONE and two of the decisions are not worth relitigating.**
   Direct distribution with a notarized `.pkg`, and the driver bundled under GPL-3.0
-  compliance. The second forces the first: GPL-3.0's anti-Tivoization terms conflict with
+  compliance. Both are executed as of v0.9.0. The second forces the first: GPL-3.0's anti-Tivoization terms conflict with
   App Store terms, so **the Mac App Store is closed off** for as long as the driver ships
   inside the installer. The fallback, if that ever inverts, is to unbundle the driver and have
   users install BlackHole themselves — which costs the "PlugInput" device name.
@@ -464,8 +503,9 @@ whether the engine actually started. Delete it to reset the app.
   maintain. The license text ships inside the bundle, and README states plainly that this is a
   modified build, not the official binary, and not supported by Existential Audio. Contacting
   Existential Audio is a courtesy their README asks for, not a license term.
-- **Confirm the chain UI by hand.** The engine below it is measured; the buttons are not. Worth
-  one pass: add two or three effects, reorder with ↑/↓, toggle bypass while running (should be
+- **Confirm the chain UI by hand — now the most valuable open item.** It shipped in v0.9.0
+  unclicked, and the release notes say so, but a first user will reach it before anyone here
+  does. The engine below it is measured; the buttons are not. Worth one pass: add two or three effects, reorder with ↑/↓, toggle bypass while running (should be
   seamless — it is the one edit that does not cycle the engine), open two plugin windows at
   once, remove one. `chain: added` / `chain: removed` / `chain: reordered to …` lines in the log
   are the readout.
@@ -475,10 +515,18 @@ whether the engine actually started. Delete it to reset the app.
 - **Remaining UI polish:** an explicit monitor/output device picker — monitoring currently
   follows the system default output. The searchable browser, dB meter, routing summary, chain
   editor, latency badge, monitor toggle, input-channel picker, and activity log are done.
+- **SSL Native Vocalstrip 2 crashes the app on quit.** Reproduced twice on 2026-08-19:
+  `EXC_BAD_ACCESS` / `SIGSEGV` on a null `pthread_mutex_lock`, on the plugin's own
+  `JUCE v8.0.10: Timer` thread, during termination of a process that had already torn the engine
+  down. Gotcha #8 — plugins load in-process, so this takes the host with it — and it is a
+  third-party bug rather than one in this code, but it is reproducible with a plugin in daily use
+  here and a user will hit it. Teardown running before the session save (gotcha #25) is what
+  keeps it from orphaning the aggregate; verified none was left behind. Reports are in
+  `~/Library/Logs/DiagnosticReports/PlugInput-*.ips`.
 - **Still missing for a confident v1:** an app icon, crash reporting (with in-process plugin
   hosting, crash reports are the only way to learn which plugin broke someone's setup), and an
-  update mechanism. Retrofitting updates onto already-installed copies is painful, so it is
-  worth deciding before 1.0.
+  update mechanism. Now that v0.9.0 is installed on other machines, retrofitting updates is the
+  painful one — it is the next decision worth making, not a later one.
 
 Persistence and the login item are built — see "Persistence" above.
 
