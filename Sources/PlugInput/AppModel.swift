@@ -108,14 +108,22 @@ final class AppModel {
     private var hasRestored = false
     private var hasQuit = false
 
-    /// Serialises transport work against itself.
+    /// The tail of the transport chain: every start, stop and restart waits on the one before it.
     ///
     /// `@MainActor` orders statements but not *tasks* across suspension points, and every route
-    /// into `start()`/`stop()` goes through `await` — `toggle`, `selectInput`,
-    /// `setMonitorEnabled`, and each chain edit. Two overlapping starts would each call
-    /// `startMetering()`, and the second would overwrite `meterTimer` while the first kept
-    /// firing forever against a strongly captured `self`.
-    private var isTransportBusy = false
+    /// into transport goes through `await` — `toggle`, `selectInput`, `setMonitorEnabled`, and
+    /// each chain edit. Two overlapping starts would each call `startMetering()`, and the second
+    /// would overwrite `meterTimer` while the first kept firing forever against a strongly
+    /// captured `self`.
+    ///
+    /// This used to be a `isTransportBusy` flag that made an overlapping call **return without
+    /// doing anything**, which prevented the overlap by discarding the request. Clicking ↑ twice
+    /// in quick succession, or removing a slot while the previous edit's restart was still in
+    /// flight, therefore left the engine running the *previous* chain while the editor showed
+    /// the new one — audible order silently disagreeing with displayed order, which is the exact
+    /// class of failure this app exists to avoid. Queueing costs an extra engine cycle and keeps
+    /// the two in step.
+    private var transportTail: Task<Void, Never>?
 
     /// A plugin window has no "save" button — parameters change whenever the user drags a knob.
     /// Capturing on a slow timer bounds what a crash can cost without serializing the plugin's
@@ -499,18 +507,40 @@ final class AppModel {
     /// Changing the graph requires a stop/start cycle. That costs a brief dropout, which is a
     /// better trade than the fragility of rewiring a running AVAudioEngine.
     private func restartIfRunning() async {
-        guard isRunning else { return }
-        await stop()
-        await start()
+        // One queued unit, not `await stop()` followed by `await start()`. As two, another edit
+        // could slot its own cycle between them and leave the engine stopped or a cycle behind.
+        // `isRunning` is read inside, when the work runs, not when it was submitted.
+        await serialized {
+            guard self.isRunning else { return }
+            await self.performStop()
+            await self.performStart()
+        }
     }
 
     // MARK: - Transport
 
+    /// Runs transport work after everything already queued, and never before.
+    ///
+    /// The body re-reads `isRunning`, `chain` and `orderedUnits` when it actually runs rather
+    /// than when it was submitted, so a request queued behind a restart acts on the state that
+    /// restart left behind.
+    private func serialized(_ work: @escaping @MainActor () async -> Void) async {
+        let predecessor = transportTail
+        let task = Task { @MainActor in
+            await predecessor?.value
+            await work()
+        }
+        transportTail = task
+        await task.value
+    }
+
     func toggle() async {
-        if isRunning {
-            await stop()
-        } else {
-            await start()
+        await serialized {
+            if self.isRunning {
+                await self.performStop()
+            } else {
+                await self.performStart()
+            }
         }
     }
 
@@ -518,10 +548,10 @@ final class AppModel {
     /// the main actor stays responsive while CoreAudio negotiates with coreaudiod. See the
     /// isolation note on `AudioEngineController`.
     func start() async {
-        guard !isTransportBusy else { return }
-        isTransportBusy = true
-        defer { isTransportBusy = false }
+        await serialized { await self.performStart() }
+    }
 
+    private func performStart() async {
         guard let inputUID = selectedInputUID,
               let input = inputDevices.first(where: { $0.uid == inputUID })
         else {
@@ -600,15 +630,22 @@ final class AppModel {
     }
 
     func stop() async {
-        guard !isTransportBusy else { return }
-        isTransportBusy = true
-        defer { isTransportBusy = false }
+        await serialized { await self.performStop() }
+    }
 
+    private func performStop() async {
         stopMetering()
         await engine.stopAsync()
         isRunning = false
         inputPeak = 0
-        persistSession { $0.settingRunning(false) }
+        // `update`, not `persistSession`. Capturing every loaded plugin's `fullState` is a
+        // main-thread call into vendor code with no bound on how long it takes — Nectar 4 and
+        // the UAD units are seconds each — and this runs inside `restartIfRunning`, so it was
+        // being paid on **every add, remove, reorder and device change**. That is precisely the
+        // freeze people report when switching plugins. Nothing is lost by dropping it: the
+        // 30-second autosave covers a running session and `prepareForQuit` captures on the way
+        // out, which are the two moments the state actually has to be on disk.
+        update { $0.settingRunning(false) }
         if !status.hasPrefix("Could not") { status = "" }
     }
 
@@ -716,8 +753,8 @@ final class AppModel {
         // Never leave a previous timer running. `meterTimer` used to be overwritten outright,
         // so an overlapping start orphaned a 20 Hz timer that kept firing — and, capturing
         // `self` strongly, kept the whole model alive with it. `stopMetering` could only ever
-        // cancel the newest of them. The `isTransportBusy` guard should make an overlap
-        // impossible now; this makes it harmless if one ever gets through anyway.
+        // cancel the newest of them. Serialising transport through `serialized` should make an
+        // overlap impossible now; this makes it harmless if one ever gets through anyway.
         stopMetering()
         meterTicks = 0
 

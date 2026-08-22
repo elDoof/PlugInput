@@ -53,7 +53,26 @@ README describe *use* while this describes *why*.
 
 ### Recent changes
 
-Two features, in this order — the first exists to make the second safe:
+**Post-v0.9.0 stability work on the plugin-switch path**, from four separate defects (gotchas
+#29–#32). Switching plugins crashed and froze, and none of it was the third-party plugins' fault:
+
+- The engine queue was performing the **last release of an `AVAudioUnit`**, so the vendor's
+  teardown — including AppKit window closes — ran off the main thread. Confirmed from a crash
+  report, not inferred. Fixed by `releaseOnMainThread`.
+- Plugin windows **did not retain the vendor's view controller**, leaving a live view wired to a
+  deallocated owner. Fixed by `contentViewController`.
+- The `isTransportBusy` flag **discarded** overlapping transport requests instead of serialising
+  them, so a fast second chain edit could leave the engine a cycle behind the editor. Replaced by
+  a queue.
+- `stop()` serialised every plugin's `fullState` on the main thread, and every chain edit goes
+  through `stop()`. Removed from that path; the autosave and quit still capture.
+
+Measured after the change: Nectar 4 Compressor → SSL Native Vocalstrip 2 at **−34.1 dBFS
+broadband** on the two-process listener, four clean launch/quit cycles with both loaded, no
+crash report, no orphaned aggregate. 74 unit tests pass. The click-level chain UI is still
+unclicked — see "Not verified from here" above.
+
+Two features before that, in this order — the first exists to make the second safe:
 
 - **An Objective-C exception barrier around graph mutation** (gotcha #21). `installTap`,
   `attach`, `connect`, `detach`, `prepare` and `mainMixerNode` *raise* rather than throw, and an
@@ -75,7 +94,7 @@ Two standing non-deliveries, both deliberate:
 ## Build and run
 
 ```bash
-swift build && swift test     # library + 63 unit tests
+swift build && swift test     # library + 74 unit tests
 ./make-driver.sh install      # builds + installs the PlugInput HAL driver (sudo, once)
 ./make-app.sh release         # assembles PlugInput.app
 open PlugInput.app            # waveform icon appears in the menu bar
@@ -110,7 +129,8 @@ be answered without touching the menu bar. When the app is wedged rather than wr
 Sources/AudioCore/       no UI imports — the testable half
   Devices/     CoreAudioProperties, DeviceEnumerator, AggregateDeviceBuilder, InputSelection,
                DeviceDiscovery, VirtualMicrophone (naming constants — see gotchas #17, #19)
-  Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel, ObjCExceptionBarrier
+  Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel, ObjCExceptionBarrier,
+               MainThreadRelease (gotcha #29)
   Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch, PluginChain
   Persistence/ SessionSnapshot, SessionStore
   Diagnostics/ EngineLog, EngineLogReader, AudioLevel
@@ -119,7 +139,7 @@ Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindo
                          LoginItem
   Views/       ConsoleView (window: routing, meter, activity), ChainEditorView (reorder,
                bypass, remove), PluginBrowserView (search, adds to the chain)
-Tests/AudioCoreTests/    71 tests
+Tests/AudioCoreTests/    74 tests
 Spike/                 Phase 0 verification harness — separate package, kept as reference
 ```
 
@@ -447,6 +467,66 @@ silence rather than an error.
     first symptom is `stapler` failing with "Record not found", which names neither the cause nor
     the file. `make-pkg.sh` now reads the status and prints `notarytool log` on rejection, which
     is where the two errors above actually came from.
+29. **Whichever queue lets go of an Audio Unit runs the vendor's teardown on that thread.**
+    Releasing the last reference to an `AVAudioUnit` is not bookkeeping: it runs
+    `-[AVAudioNode dealloc]` → `AudioComponentInstanceDispose` → the plugin's own teardown, on
+    whatever thread happened to drop it. Plugins tear down their *interface* in there. iZotope's
+    Nectar 4 calls `-[NSWindow close]`; AppKit off the main thread traps with "Must only be used
+    from the main thread" and the process aborts. JUCE plugins want the message thread — which on
+    macOS is the main thread — for the same work, by a different name.
+    `stopOnQueue` did `effectNodes = []` on `com.pluginput.engine`, so the engine queue was doing
+    exactly that. Confirmed from a crash report rather than inferred: faulting thread
+    `com.pluginput.engine`, stack reading `stopOnQueue` → `swift_arrayDestroy` →
+    `-[AVAudioNode dealloc]` → `AudioComponentInstanceDispose` → `iZNectar4Core` → `NSWindow
+    _close` → trap.
+    **It only fires on remove, which is why it looked like "crashes when switching plugins".**
+    `AppModel.removeSlot` drops its own reference first, so the engine's array is holding the only
+    one left by the time the restart tears the graph down. Add and reorder keep the unit in
+    `loadedUnits` throughout, so the queue's release is never the last one and nothing happens.
+    `releaseOnMainThread` (`Sources/AudioCore/Engine/MainThreadRelease.swift`) is the fix: empty
+    the array into an `@unchecked Sendable` box and let the box die on the main queue. It is
+    covered by a test *and its control* — asserting "released on main" proves nothing unless the
+    same probe demonstrably reports a background thread with the hop removed.
+    At termination the main queue never drains again, so units handed over during quit are simply
+    never disposed. That is the intended outcome: the OS reclaims the memory, `persistSession` has
+    already captured every plugin's settings, and a vendor's exit-time teardown is what has been
+    taking this app down on quit. Four launch/quit cycles with SSL Native Vocalstrip 2 and Nectar 4
+    loaded and the engine running produced no crash report, where that plugin had reproduced one
+    twice the day before — suggestive, not proof, since the original was a race.
+30. **An `NSViewController` is not retained by its own view, and an AU's editor is a view
+    controller.** `requestViewController` hands back the vendor's controller; the window took
+    `viewController.view` and let the controller go at the end of the method. The view stayed on
+    screen, drawn correctly, wired through bindings, target/action, `AUAudioUnit` KVO and redraw
+    timers to an owner that had already been deallocated — so a plugin window opened fine and died
+    on the next interaction or on close, with a stack in vendor code and nothing pointing here.
+    `window.contentViewController = viewController` is the whole fix: the window owns the
+    controller and its lifetime becomes the window's.
+    One consequence worth knowing before editing that method: assigning `contentViewController`
+    **resizes the window to the view**, and assigning `contentView` does not. The "no custom
+    interface" fallback therefore needs a content rect that was right when the window was built,
+    which is what `placeholderSize` is for.
+31. **A busy flag that makes an overlapping request return early does not serialise it — it
+    discards it.** `isTransportBusy` guarded `start()` and `stop()`, and every route into transport
+    is an `await` from an unstructured `Task` (`toggle`, `selectInput`, `setMonitorEnabled`, and
+    each chain edit). A second edit arriving during the first edit's restart therefore found the
+    flag set, returned from *both* its stop and its start, and never rebuilt the graph — leaving
+    the engine running the previous chain while the editor displayed the new one. Audible order
+    silently disagreeing with displayed order, from clicking ↑ twice quickly. `serialized(_:)`
+    queues the work behind whatever is in flight instead; the body re-reads `isRunning` and
+    `orderedUnits` when it *runs*, not when it was submitted, so a request queued behind a restart
+    acts on what that restart left behind. `restartIfRunning` is one queued unit rather than two,
+    or another edit could slot its own cycle between the stop and the start.
+32. **`stop()` was capturing every plugin's `fullState` on the main thread — inside every chain
+    edit.** `persistSession` asks each loaded unit to serialise its entire state, which is an
+    unbounded call into vendor code (Nectar 4 and the UAD units take seconds), and
+    `restartIfRunning` goes through `stop()`. So add, remove, reorder, device change and channel
+    change each paid a full-chain state capture on the main thread — the freeze people report when
+    switching plugins. It now writes only the `isRunning` flag there. Nothing is lost: the
+    30-second autosave covers a running session and `prepareForQuit` captures on the way out.
+    Verified rather than assumed — after a quit, `session.json` still carried 1360 and 4724 bytes
+    of plugin state for the two slots.
+    The same call still runs at quit, where it is a documented and deliberate risk (see
+    `prepareForQuit`); teardown runs first precisely so a slow vendor cannot cost the aggregate.
 
 ## Persistence
 
@@ -515,7 +595,12 @@ whether the engine actually started. Delete it to reset the app.
 - **Remaining UI polish:** an explicit monitor/output device picker — monitoring currently
   follows the system default output. The searchable browser, dB meter, routing summary, chain
   editor, latency badge, monitor toggle, input-channel picker, and activity log are done.
-- **SSL Native Vocalstrip 2 crashes the app on quit.** Reproduced twice on 2026-08-19:
+- **SSL Native Vocalstrip 2 crashes the app on quit — possibly fixed, not proven.** Gotcha #29
+  removed the reason a plugin was ever disposed off the main thread, and JUCE teardown off the
+  message thread is the shape of this crash. Four launch/quit cycles with the plugin loaded and
+  the engine running produced none, where it had reproduced twice the day before. That is a
+  suggestive result against a race, not a clearance; leave this open until it survives ordinary
+  use. The original evidence, reproduced twice on 2026-08-19:
   `EXC_BAD_ACCESS` / `SIGSEGV` on a null `pthread_mutex_lock`, on the plugin's own
   `JUCE v8.0.10: Timer` thread, during termination of a process that had already torn the engine
   down. Gotcha #8 — plugins load in-process, so this takes the host with it — and it is a

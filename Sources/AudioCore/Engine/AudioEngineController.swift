@@ -362,12 +362,36 @@ public final class AudioEngineController: @unchecked Sendable {
         for node in effectNodes {
             ignoringObjCException("detaching effect") { engine.detach(node) }
         }
-        effectNodes = []
+        releaseEffectsOnMain()
         aggregate?.destroy()
         aggregate = nil
         peakLevel.reset()
         publish(state: .stopped)
         publish(effectLatency: 0)
+    }
+
+    /// Hands the chain's units to the main queue and lets go of them there, never here.
+    ///
+    /// **The engine queue must never perform the *last* release of an `AVAudioUnit`.** Dropping
+    /// the final reference runs `-[AVAudioNode dealloc]` → `AudioComponentInstanceDispose` →
+    /// the vendor's own teardown, on whatever thread let go. Plugins tear down their interface
+    /// in there: iZotope's Nectar 4 calls `-[NSWindow close]`, which is AppKit, which traps with
+    /// "Must only be used from the main thread" and aborts the process. Confirmed from a crash
+    /// report — the faulting thread was `com.pluginput.engine`, inside `stopOnQueue`, releasing
+    /// this exact array.
+    ///
+    /// It fires on **removing a slot**, which is the common half of switching plugins:
+    /// `AppModel.removeSlot` drops its own reference first, so by the time the restart tears the
+    /// graph down, `effectNodes` is holding the only one left. Add and reorder keep the unit in
+    /// `loadedUnits` throughout, which is why they were survivable and remove was not.
+    ///
+    /// The same hop is why teardown-shaped plugin bugs stop being ours: a JUCE plugin disposed
+    /// off the message thread is a documented crash on the vendor's side too, and the main
+    /// queue *is* their message thread.
+    ///
+    /// `releaseOnMainThread` carries the how, including what it means at termination.
+    private func releaseEffectsOnMain() {
+        releaseOnMainThread(&effectNodes)
     }
 
     // MARK: - Readable from any thread
