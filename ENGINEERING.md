@@ -65,7 +65,10 @@ README describe *use* while this describes *why*.
   them, so a fast second chain edit could leave the engine a cycle behind the editor. Replaced by
   a queue.
 - `stop()` serialised every plugin's `fullState` on the main thread, and every chain edit goes
-  through `stop()`. Removed from that path; the autosave and quit still capture.
+  through `stop()`. Removed from that path; the autosave and quit still capture. This was
+  *claimed* to be the freeze and then measured at 7–9 ms across four heavy plugins, so it was
+  not — see gotcha #32. **The freeze remains unexplained**; what the work bought is that the
+  path is now instrumented and a future one will name its own cause.
 
 Measured after the change: Nectar 4 Compressor → SSL Native Vocalstrip 2 at **−34.1 dBFS
 broadband** on the two-process listener, four clean launch/quit cycles with both loaded, no
@@ -516,17 +519,30 @@ silence rather than an error.
     `orderedUnits` when it *runs*, not when it was submitted, so a request queued behind a restart
     acts on what that restart left behind. `restartIfRunning` is one queued unit rather than two,
     or another edit could slot its own cycle between the stop and the start.
-32. **`stop()` was capturing every plugin's `fullState` on the main thread — inside every chain
-    edit.** `persistSession` asks each loaded unit to serialise its entire state, which is an
-    unbounded call into vendor code (Nectar 4 and the UAD units take seconds), and
-    `restartIfRunning` goes through `stop()`. So add, remove, reorder, device change and channel
-    change each paid a full-chain state capture on the main thread — the freeze people report when
-    switching plugins. It now writes only the `isRunning` flag there. Nothing is lost: the
-    30-second autosave covers a running session and `prepareForQuit` captures on the way out.
-    Verified rather than assumed — after a quit, `session.json` still carried 1360 and 4724 bytes
-    of plugin state for the two slots.
-    The same call still runs at quit, where it is a documented and deliberate risk (see
-    `prepareForQuit`); teardown runs first precisely so a slow vendor cannot cost the aggregate.
+32. **`stop()` was capturing every plugin's `fullState` on the main thread inside every chain
+    edit — and that was *not* the freeze, which is worth recording because it was claimed here
+    first and measured second.** `persistSession` asks each loaded unit to serialise its entire
+    state, an unbounded call into vendor code, and `restartIfRunning` goes through `stop()`, so
+    add, remove, reorder, device change and channel change each paid a full-chain capture on the
+    main thread. Removing it from that path is still right — an unbounded vendor call has no
+    business inside a per-edit path, and the autosave already covered it — but the entry
+    originally asserted it was "precisely the freeze people report", on nothing but the shape of
+    the code.
+    Then it was instrumented, and a four-plugin chain of UADx LA-2A Gray Compressor →
+    Nectar 4 Compressor → Nectar 4 Equalizer → SSL Native Vocalstrip 2 measured **7–9 ms for the
+    whole chain**, worst single plugin 7 ms. Applying saved state on relaunch was 0–5 ms per
+    plugin. Neither is a freeze at any chain size this app allows.
+    So **the freeze is still unexplained**, and the plausible remaining mechanism is gotcha #29's
+    off-main disposal rather than anything about persistence: an `AudioComponentInstanceDispose`
+    running on `com.pluginput.engine` can block there, and the old `isTransportBusy` flag then
+    made every later start and stop return instantly without doing anything, so the app stayed
+    wedged rather than recovering. Both halves of that are now fixed, which may be enough — but
+    nothing here has reproduced a freeze, so treat that as the next thing to confirm, not as a
+    conclusion.
+    What the instrumentation buys is that a future freeze names its own cause. `capturedStates`
+    and `instantiate` log their timings, and a capture over 100 ms logs at **error** level naming
+    the plugin responsible. What plugin loading costs is worth knowing too: 130–1027 ms per
+    plugin, off the main actor but sequential, so a four-plugin chain adds ~2.7 s to launch.
 
 ## Persistence
 

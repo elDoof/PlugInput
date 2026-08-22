@@ -130,6 +130,10 @@ final class AppModel {
     /// whole state on every mouse move.
     private static let autosaveInterval: TimeInterval = 30
 
+    /// Past this, a state capture is a hitch the user can feel rather than a background cost,
+    /// and the log says so at error level with the responsible plugin named.
+    private static let slowStateCaptureMilliseconds = 100
+
     /// `store` is injectable for testing; `nil` means "open the default location", which is what
     /// the app does.
     ///
@@ -479,12 +483,24 @@ final class AppModel {
     }
 
     /// Instantiates one slot's plugin and files the unit under that slot's id.
+    ///
+    /// Both halves are timed for the same reason `capturedStates` is: they are calls into vendor
+    /// code with no bound on how long they take, and a user who sees the app hang while adding a
+    /// plugin — or for the whole of a launch that restores a saved chain — has no way to tell
+    /// which plugin did it. `instantiate` runs off the main actor; `PluginState.apply` does not,
+    /// and setting `fullState` is the same unbounded vendor call as reading it.
     @discardableResult
     private func instantiate(_ slot: PluginSlot) async -> Bool {
+        let clock = ContinuousClock()
+        let startedLoad = clock.now
+
         do {
             let unit = try await PluginCatalog.instantiate(slot.plugin)
+            let loadMilliseconds = Self.milliseconds(since: startedLoad, on: clock)
+            var applyMilliseconds = 0
 
             if let state = slot.state {
+                let startedApply = clock.now
                 do {
                     try PluginState.apply(state, to: unit)
                 } catch {
@@ -492,8 +508,14 @@ final class AppModel {
                     status = "\(slot.plugin.name) loaded with default settings — its saved "
                         + "settings could not be restored."
                 }
+                applyMilliseconds = Self.milliseconds(since: startedApply, on: clock)
             }
+
             unit.auAudioUnit.shouldBypassEffect = slot.isBypassed
+
+            EngineLog.logger.info(
+                "loaded \(slot.plugin.name, privacy: .public) in \(loadMilliseconds, privacy: .public)ms, state applied in \(applyMilliseconds, privacy: .public)ms on the main thread"
+            )
 
             loadedUnits[slot.id] = unit
             startAutosave()
@@ -733,18 +755,60 @@ final class AppModel {
     /// Reads each loaded unit's current settings. A plugin that refuses keeps whatever was saved
     /// before rather than losing its slot's settings — one uncooperative plugin must not wipe the
     /// rest of the chain.
+    ///
+    /// **Timed, because this is the app's last unbounded main-thread call into vendor code.**
+    /// `fullState` asks a plugin to serialise everything it knows, and how long that takes is
+    /// entirely the vendor's business — some archive sample banks or impulse responses. It used
+    /// to run inside every chain edit as well, which is what the switching-plugins freeze was
+    /// (gotcha #32); what remains is the 30-second autosave and `prepareForQuit`, where a slow
+    /// vendor spends a termination window the OS has already bounded. There is no safe way to
+    /// interrupt a call like that, so the honest response is to measure it and name the plugin
+    /// in the log rather than leave the freeze unattributed.
     private func capturedStates() -> [UUID: Data] {
         var states: [UUID: Data] = [:]
+        var timings: [String] = []
+        let clock = ContinuousClock()
+        let startedAll = clock.now
+
         for slot in chain.slots {
             guard let unit = loadedUnits[slot.id] else { continue }
+            let started = clock.now
             do {
                 states[slot.id] = try PluginState.capture(from: unit)
             } catch {
                 status = "Could not read \(slot.plugin.name)'s settings: "
                     + error.localizedDescription
             }
+            timings.append("\(slot.plugin.name) \(Self.milliseconds(since: started, on: clock))ms")
+        }
+
+        guard !timings.isEmpty else { return states }
+
+        let total = Self.milliseconds(since: startedAll, on: clock)
+        let line = timings.joined(separator: ", ")
+        // Past the threshold this is a hitch the user can feel, so it is an error rather than a
+        // note — and it names the plugin responsible, which nothing else in the log can.
+        if total >= Self.slowStateCaptureMilliseconds {
+            EngineLog.logger.error(
+                "state capture blocked the main thread for \(total, privacy: .public)ms — \(line, privacy: .public)"
+            )
+        } else {
+            EngineLog.logger.info(
+                "state capture \(total, privacy: .public)ms — \(line, privacy: .public)"
+            )
         }
         return states
+    }
+
+    /// Whole milliseconds elapsed, for logging. Rounded because sub-millisecond precision says
+    /// nothing about a call this size and only makes the line harder to scan.
+    private static func milliseconds(
+        since start: ContinuousClock.Instant,
+        on clock: ContinuousClock
+    ) -> Int {
+        let elapsed = clock.now - start
+        return Int((Double(elapsed.components.seconds) * 1000)
+            + (Double(elapsed.components.attoseconds) / 1_000_000_000_000_000))
     }
 
     // MARK: - Timers
