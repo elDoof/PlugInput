@@ -97,7 +97,7 @@ Two standing non-deliveries, both deliberate:
 ## Build and run
 
 ```bash
-swift build && swift test     # library + 74 unit tests
+swift build && swift test     # library + 80 unit tests
 ./make-driver.sh install      # builds + installs the PlugInput HAL driver (sudo, once)
 ./make-app.sh release         # assembles PlugInput.app
 open PlugInput.app            # waveform icon appears in the menu bar
@@ -136,13 +136,14 @@ Sources/AudioCore/       no UI imports — the testable half
                MainThreadRelease (gotcha #29)
   Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch, PluginChain
   Persistence/ SessionSnapshot, SessionStore
-  Diagnostics/ EngineLog, EngineLogReader, AudioLevel
+  Diagnostics/ EngineLog, EngineLogReader, AudioLevel, MainThreadWatchdog +
+               MainThreadStallDetector (gotcha #34)
 Sources/ObjCExceptionBridge/  the only Objective-C in the project — @try/@catch, see gotcha #21
 Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindowController,
                          LoginItem
   Views/       ConsoleView (window: routing, meter, activity), ChainEditorView (reorder,
                bypass, remove), PluginBrowserView (search, adds to the chain)
-Tests/AudioCoreTests/    74 tests
+Tests/AudioCoreTests/    80 tests
 Spike/                 Phase 0 verification harness — separate package, kept as reference
 ```
 
@@ -543,6 +544,48 @@ silence rather than an error.
     and `instantiate` log their timings, and a capture over 100 ms logs at **error** level naming
     the plugin responsible. What plugin loading costs is worth knowing too: 130–1027 ms per
     plugin, off the main actor but sequential, so a four-plugin chain adds ~2.7 s to launch.
+33. **A plugin's static teardown runs *after* your app has finished quitting, and it can still
+    take the process down.** SSL Native Vocalstrip 2 segfaults on a null `pthread_mutex_lock`
+    from its own `JUCE v8.0.10: Timer` thread. The timing is the tell: `prepareForQuit` completed
+    at 23:16:12 — aggregate destroyed, session written, engine down — and the crash landed at
+    **23:16:16**, four seconds later, while the process was running static destructors and
+    tearing down JUCE's globals underneath a timer thread that was still ticking. Nothing in this
+    app is on that stack, and gotcha #29 does not help: it reproduced on the build that fixed the
+    disposal thread, which is worth stating because this entry previously guessed it might be
+    fixed and was wrong.
+    Nothing here can order those two events. What it can do is not give them a chance to race:
+    `prepareForQuit` now ends in **`_exit(EXIT_SUCCESS)`**, so the kernel tears the process down
+    immediately with no atexit handlers and no static destructors, and no vendor gets an exit-time
+    turn. `exit` would not do — running atexit handlers is precisely what crashes. It is the same
+    reasoning as gotcha #29's decision not to dispose units at termination, carried to the end of
+    the process, and it generalises past this one plugin, which matters because the next report
+    will come from a user whose plugins nobody here owns.
+    Two things to know before touching it. Everything the app owns must be flushed *above* that
+    line — `persistSession` is, and `UserDefaults.standard.synchronize()` is called for the
+    console window frame SwiftUI keeps there. And the Quit button's `NSApplication.terminate`
+    is now unreachable, which is fine but means `prepareForQuit` is the only exit path there is.
+    Why this is worth doing for a crash that costs the user nothing: it happens *after* a
+    successful quit, so no state is lost — but macOS shows a crash dialog every time, for an app
+    that had already shut down correctly.
+34. **The freeze had to be made self-reporting, because it has never reproduced here.** A frozen
+    menu bar app is uniquely undiagnosable: no window to show an error in, no log line — the
+    thread that would write it is the stuck one — and the only way out is Activity Monitor, which
+    leaves no record. `sample $(pgrep PlugInput)` is the right tool and needs somebody at a
+    terminal *during* the freeze, which is nobody.
+    `MainThreadWatchdog` pings the main queue twice a second from a private queue and logs at
+    **error** level when a ping takes longer than 2s to come back, then again with the peak
+    duration when it clears. It does not name the blocking frame, but it timestamps the stall,
+    and the engine transcript around that timestamp says what the app was doing.
+    **It reports and never intervenes.** Whatever is blocking the main thread is generally inside
+    third-party plugin code, there is no safe way to interrupt it, and a watchdog that tried would
+    turn a freeze into a crash.
+    The decision logic is a separate value type, `MainThreadStallDetector`, with six tests: what
+    could be *wrong* about a stall report is reporting one stall repeatedly (burying the
+    transcript that explains it), missing the recovery, or reporting the duration seen at recovery
+    — which is near zero, since the main thread has just answered, and would understate every
+    stall to nothing. Verified end to end against the real app with `kill -STOP`: 75 seconds of
+    ordinary running including a four-plugin load produced no report, and an induced 5.2s stall
+    produced exactly one, plus its recovery.
 
 ## Persistence
 
@@ -611,18 +654,12 @@ whether the engine actually started. Delete it to reset the app.
 - **Remaining UI polish:** an explicit monitor/output device picker — monitoring currently
   follows the system default output. The searchable browser, dB meter, routing summary, chain
   editor, latency badge, monitor toggle, input-channel picker, and activity log are done.
-- **SSL Native Vocalstrip 2 crashes the app on quit — possibly fixed, not proven.** Gotcha #29
-  removed the reason a plugin was ever disposed off the main thread, and JUCE teardown off the
-  message thread is the shape of this crash. Four launch/quit cycles with the plugin loaded and
-  the engine running produced none, where it had reproduced twice the day before. That is a
-  suggestive result against a race, not a clearance; leave this open until it survives ordinary
-  use. The original evidence, reproduced twice on 2026-08-19:
-  `EXC_BAD_ACCESS` / `SIGSEGV` on a null `pthread_mutex_lock`, on the plugin's own
-  `JUCE v8.0.10: Timer` thread, during termination of a process that had already torn the engine
-  down. Gotcha #8 — plugins load in-process, so this takes the host with it — and it is a
-  third-party bug rather than one in this code, but it is reproducible with a plugin in daily use
-  here and a user will hit it. Teardown running before the session save (gotcha #25) is what
-  keeps it from orphaning the aggregate; verified none was left behind. Reports are in
+- **SSL Native Vocalstrip 2 crashed the app on quit — addressed at the process level, see gotcha
+  #33.** It is a third-party exit-time race: the plugin's own JUCE timer thread segfaults on a
+  null `pthread_mutex_lock` seconds *after* teardown finished, while static destructors tear down
+  JUCE's globals underneath it. Gotcha #29 did **not** fix it — it reproduced on that build, which
+  is recorded because an earlier note here guessed it might have. `prepareForQuit` now ends in
+  `_exit`, so no vendor gets an exit-time turn at all. Reports are in
   `~/Library/Logs/DiagnosticReports/PlugInput-*.ips`.
 - **Still missing for a confident v1:** an app icon, crash reporting (with in-process plugin
   hosting, crash reports are the only way to learn which plugin broke someone's setup), and an
@@ -654,6 +691,13 @@ edited directly to drive a restart-and-observe loop: that is how the monitor tog
 in both positions, and how a three-plugin chain was checked end to end. A running app rewrites
 that file on its 30-second autosave, so quit it before editing, and back it up first since it
 holds a real setup.
+
+**Getting that order wrong produces a green result, not an error.** A ten-cycle quit-crash test
+was seeded while the app was still running; the app overwrote the seed with its own empty chain
+on quit, every cycle then launched with no plugins at all, and the run reported zero crashes —
+which is exactly what a fix looks like. It was caught only by counting `engine started` lines and
+finding ten launches and zero starts. Assert that the seeded setup actually loaded before
+believing what a scripted run tells you.
 
 Quit with `osascript -e 'quit app "PlugInput"'` rather than `killall` when testing teardown.
 `killall` skips `willTerminate`, so it neither destroys the aggregate (gotcha #7) nor exercises

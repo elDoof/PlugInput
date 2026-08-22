@@ -99,6 +99,10 @@ final class AppModel {
     let pluginWindows = PluginWindowController()
 
     private let engine = AudioEngineController()
+
+    /// Watches for the main thread going unresponsive and logs it. Reports only — see
+    /// `MainThreadWatchdog` for why nothing tries to intervene.
+    private let watchdog = MainThreadWatchdog()
     private let store: SessionStore?
     private var snapshot: SessionSnapshot = .empty
     private var meterTimer: Timer?
@@ -189,6 +193,10 @@ final class AppModel {
         engine.onUnexpectedStop { [weak self] reason in
             Task { @MainActor in self?.handleUnexpectedStop(reason) }
         }
+
+        // Started before anything else can block: a stall during the restore that follows is
+        // exactly the kind this is for, and `restore()` is where third-party plugins first load.
+        watchdog.start()
 
         scheduleRestore()
     }
@@ -686,16 +694,44 @@ final class AppModel {
     ///
     /// Plugin windows close before the units behind them are torn down: a vendor's view
     /// controller outliving the `AVAudioUnit` that owns it is a well-known AU-host crash on exit.
+    ///
+    /// **It ends in `_exit`, deliberately.** Everything the app owns is safely down by that
+    /// point — aggregate destroyed, session written — and what remains is other people's
+    /// exit-time code. SSL Native Vocalstrip 2 segfaults on a null `pthread_mutex_lock` from its
+    /// own `JUCE v8.0.10: Timer` thread, *seconds after* this method returns, while the process
+    /// is running static destructors and tearing down JUCE's globals underneath a timer thread
+    /// that is still ticking. Nothing in this app is on that stack and nothing in this app can
+    /// order those two events; the plugin loads in-process (gotcha #8), so it takes the host
+    /// with it and macOS shows the user a crash dialog for an app that had already finished
+    /// quitting correctly.
+    ///
+    /// `_exit` closes the window that race needs by not opening it: the kernel tears the process
+    /// down immediately, with no atexit handlers and no static destructors, so no vendor gets an
+    /// exit-time turn. It is the same reasoning as gotcha #29's decision not to dispose units at
+    /// termination, carried to the end of the process — and it generalises past this one plugin,
+    /// which matters when the crash reports come from users whose plugins nobody here owns.
+    ///
+    /// What it costs: anything that would otherwise be flushed at exit. This app's own state is
+    /// already written by `persistSession` above; the one framework-owned thing worth forcing is
+    /// user defaults, where SwiftUI keeps the console window's frame. `exit` rather than `_exit`
+    /// would not do — running atexit handlers is precisely what crashes.
     func prepareForQuit() {
         guard !hasQuit else { return }
         hasQuit = true
 
         stopMetering()
         stopAutosave()
+        // Before teardown, not after. `stopForTermination` blocks the main thread for up to two
+        // seconds by design, and a watchdog still running would report that as a freeze.
+        watchdog.stop()
         pluginWindows.closeAll()
         engine.stopForTermination()
         isRunning = false
         persistSession()
+
+        EngineLog.logger.info("quit: teardown complete, exiting before plugin static teardown")
+        UserDefaults.standard.synchronize()
+        _exit(EXIT_SUCCESS)
     }
 
     var effectLatencyMilliseconds: Double {
