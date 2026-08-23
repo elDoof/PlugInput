@@ -4,7 +4,12 @@ A macOS menu bar app that puts audio plugins on your live microphone, so you can
 compressor (or anything else) on your voice without opening a DAW — and have Zoom / Discord /
 OBS see the processed signal as a microphone.
 
-## Status: v0.9.0 released publicly, 2026-08-19
+## Status: v0.9.0 released 2026-08-19; stability work since then is committed but **unpushed**
+
+`main` is **3 commits ahead of `origin/main`** and no tag points at it. Everything under
+"Post-v0.9.0 stability work" below is local only — users are still running v0.9.0, which has all
+four of the bugs those commits fix. Deciding whether that ships as v0.9.1 is the first open
+question a new session inherits, not a detail.
 
 Shipped: <https://github.com/elDoof/PlugInput/releases/tag/v0.9.0>. The repository is public,
 the `.pkg` is signed with a Developer ID and notarized, and the published asset was verified as
@@ -14,8 +19,9 @@ matching the local build.
 
 The routing is measured, not assumed: **mic → effect chain → private aggregate → PlugInput**,
 read from a separate process at **−31.3 dBFS broadband** through a UAD + SSL chain on the
-notarized build, against a −120.0 dBFS silence control, with the app's own log line reading
-`virtual PlugInput`. Also verified: the unit
+notarized build, and again at **−34.1 dBFS** on 2026-08-21 through Nectar 4 Compressor → SSL
+Native Vocalstrip 2 after the stability work, both against a −120.0 dBFS silence control, with
+the app's own log line reading `virtual PlugInput`. Also verified: the unit
 tests, `PlugInput.app` launching and staying resident, several hundred AU effects discovered, no
 orphaned aggregates, a three-plugin chain wiring in the logged order (duplicates included), a
 pre-chain `session.json` migrating with its state intact, the monitor toggle affecting only the
@@ -24,9 +30,21 @@ monitor leg, and the exception barrier catching a real double-tap raise.
 The **graph/hardware sample-rate mismatch is fixed** (gotcha #27) — all six format numbers now
 agree at the hardware rate. It was the last release blocker.
 
-**Not verified from here:** the click-level chain UI — adding, reordering with ↑/↓, toggling
-bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
-That pass is still worth doing; see "Working on the audio path".
+**Two things remain open, and they are the honest state of the app:**
+
+- **The click-level chain UI has never been clicked** — adding, reordering with ↑/↓, toggling
+  bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
+  See "Working on the audio path".
+- **The freeze is unexplained.** Crashes on the switch path are fixed and measured (gotchas
+  #29–#31, #33), but the reported *freeze* has never reproduced here, and the leading hypothesis
+  — per-edit plugin state capture — was measured at 7–9 ms and ruled out (gotcha #32). A
+  `MainThreadWatchdog` now logs any main-thread stall over 2s at error level (gotcha #34), so
+  the next occurrence names itself. The first thing to do with a fresh freeze report is:
+
+  ```bash
+  /usr/bin/log show --last 30m --info --predicate 'subsystem == "com.pluginput.app"' \
+    --style compact | grep -i 'unresponsive\|responding again'
+  ```
 
 Reproduce it with the app running and a plugin loaded:
 
@@ -53,8 +71,9 @@ README describe *use* while this describes *why*.
 
 ### Recent changes
 
-**Post-v0.9.0 stability work on the plugin-switch path**, from four separate defects (gotchas
-#29–#32). Switching plugins crashed and froze, and none of it was the third-party plugins' fault:
+**Post-v0.9.0 stability work, unpushed** (three commits, gotchas #29–#34). Switching plugins
+crashed and froze; none of the crashes turned out to be the third-party plugins' fault, and the
+one that was is now handled anyway.
 
 - The engine queue was performing the **last release of an `AVAudioUnit`**, so the vendor's
   teardown — including AppKit window closes — ran off the main thread. Confirmed from a crash
@@ -64,16 +83,25 @@ README describe *use* while this describes *why*.
 - The `isTransportBusy` flag **discarded** overlapping transport requests instead of serialising
   them, so a fast second chain edit could leave the engine a cycle behind the editor. Replaced by
   a queue.
+- `prepareForQuit` now ends in **`_exit`**, so no plugin gets an exit-time turn. The SSL
+  Vocalstrip quit crash lands *four seconds after* teardown finishes, from the plugin's own JUCE
+  timer thread racing its globals' destruction — nothing here is on that stack, and the disposal
+  fix above did **not** cover it (it reproduced on that build).
 - `stop()` serialised every plugin's `fullState` on the main thread, and every chain edit goes
-  through `stop()`. Removed from that path; the autosave and quit still capture. This was
-  *claimed* to be the freeze and then measured at 7–9 ms across four heavy plugins, so it was
-  not — see gotcha #32. **The freeze remains unexplained**; what the work bought is that the
-  path is now instrumented and a future one will name its own cause.
+  through `stop()`. Removed from that path; the autosave and quit still capture.
+
+**Two claims in this section were wrong before they were measured, and both are recorded rather
+than quietly corrected.** The state capture was called "the freeze" and measured at 7–9 ms across
+four heavy plugins (#32). The disposal fix was called a probable fix for the SSL quit crash, and
+that crash then reproduced on it (#33). **The freeze itself remains unexplained** — what the work
+bought is `MainThreadWatchdog` (#34), so the next one carries its own evidence.
 
 Measured after the change: Nectar 4 Compressor → SSL Native Vocalstrip 2 at **−34.1 dBFS
-broadband** on the two-process listener, four clean launch/quit cycles with both loaded, no
-crash report, no orphaned aggregate. 74 unit tests pass. The click-level chain UI is still
-unclicked — see "Not verified from here" above.
+broadband** on the two-process listener; **ten** launch/quit cycles on a four-plugin UAD + Nectar
++ SSL chain, all ten starting the engine, with no crash report and no orphaned aggregate; the
+watchdog silent through 75s of ordinary running and reporting an induced 5.2s stall exactly once.
+80 unit tests pass. The click-level chain UI is still unclicked — see the two open items under
+"Status" above.
 
 Two features before that, in this order — the first exists to make the second safe:
 
@@ -620,6 +648,23 @@ whether the engine actually started. Delete it to reset the app.
 
 ## Next steps
 
+- **Ship the stability work — the first decision, because it is already written.** `main` is
+  three commits ahead of `origin/main` with four real bug fixes on it (gotchas #29–#34) and
+  nothing released. Every user is on v0.9.0 and still has all four. Push, and cut v0.9.1 with
+  `./make-pkg.sh --notarize`; the credentials are in place and unchanged. The one thing worth
+  doing *before* that is the chain-UI pass below, since a release is the natural moment to have
+  clicked the buttons at least once.
+- **Confirm the chain UI by hand — still nobody's clicked it.** It shipped in v0.9.0 unclicked,
+  the release notes say so, and a first user reaches it before anyone here does. The engine below
+  it is measured; the buttons are not. One pass: add two or three effects, reorder with ↑/↓,
+  toggle bypass while running (should be seamless — it is the one edit that does not cycle the
+  engine), open two plugin windows at once, remove one. `chain: added` / `chain: removed` /
+  `chain: reordered to …` in the log are the readout.
+  **Two of the recent fixes are only provable here.** Removing a slot is what triggered the
+  disposal crash (gotcha #29), and a plugin window surviving interaction and close is what the
+  view-controller fix (gotcha #30) is for. Both are proven at the mechanism level and neither has
+  been proven by clicking.
+
 - **Distribution is DONE and two of the decisions are not worth relitigating.**
   Direct distribution with a notarized `.pkg`, and the driver bundled under GPL-3.0
   compliance. Both are executed as of v0.9.0. The second forces the first: GPL-3.0's anti-Tivoization terms conflict with
@@ -642,12 +687,6 @@ whether the engine actually started. Delete it to reset the app.
   maintain. The license text ships inside the bundle, and README states plainly that this is a
   modified build, not the official binary, and not supported by Existential Audio. Contacting
   Existential Audio is a courtesy their README asks for, not a license term.
-- **Confirm the chain UI by hand — now the most valuable open item.** It shipped in v0.9.0
-  unclicked, and the release notes say so, but a first user will reach it before anyone here
-  does. The engine below it is measured; the buttons are not. Worth one pass: add two or three effects, reorder with ↑/↓, toggle bypass while running (should be
-  seamless — it is the one edit that does not cycle the engine), open two plugin windows at
-  once, remove one. `chain: added` / `chain: removed` / `chain: reordered to …` lines in the log
-  are the readout.
 - **Chain presets.** The chain is already one `Codable` value, so saving named chains is close to
   free: a directory of `PluginChain` JSON beside `session.json`, and a picker. The invariant that
   each slot's state travels with its own plugin is what makes a preset portable.
@@ -661,6 +700,11 @@ whether the engine actually started. Delete it to reset the app.
   is recorded because an earlier note here guessed it might have. `prepareForQuit` now ends in
   `_exit`, so no vendor gets an exit-time turn at all. Reports are in
   `~/Library/Logs/DiagnosticReports/PlugInput-*.ips`.
+- **The freeze is open and now instrumented.** It has never reproduced here, and the leading
+  hypothesis was measured and ruled out (gotcha #32). `MainThreadWatchdog` logs any stall over
+  2s at error level, so the next report should carry its own evidence — ask for
+  `main thread unresponsive` lines from the unified log before theorising. Do not guess at a
+  cause again without a number; that mistake is recorded in #32 precisely so it is not repeated.
 - **Still missing for a confident v1:** an app icon, crash reporting (with in-process plugin
   hosting, crash reports are the only way to learn which plugin broke someone's setup), and an
   update mechanism. Now that v0.9.0 is installed on other machines, retrofitting updates is the
