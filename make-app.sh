@@ -34,9 +34,13 @@ if [[ "$CONFIG" == "release" ]]; then
     ARCH_ARGS=(--arch arm64 --arch x86_64)
 fi
 
+# `"${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"}"` rather than the plain expansion: macOS ships bash 3.2,
+# where an empty array under `set -u` is an *unbound variable*, not an empty list. So
+# `./make-app.sh debug` — the only path that leaves this array empty — exited before it built
+# anything, while release builds worked and hid it.
 echo "==> Building ($CONFIG${ARCH_ARGS:+, universal})"
-swift build -c "$CONFIG" "${ARCH_ARGS[@]}"
-BINARY="$(swift build -c "$CONFIG" "${ARCH_ARGS[@]}" --show-bin-path)/PlugInput"
+swift build -c "$CONFIG" "${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"}"
+BINARY="$(swift build -c "$CONFIG" "${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"}" --show-bin-path)/PlugInput"
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
@@ -51,6 +55,17 @@ cp "$BINARY" "$APP/Contents/MacOS/PlugInput"
 # added to the bundle has to be added before the `codesign` at the end of this file.
 cp "$(dirname "$0")/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
 chmod +x "$APP/Contents/Resources/uninstall.sh"
+
+# The icon, copied for the same reason and under the same rule: before the codesign below.
+# It is a committed artifact rather than something rendered here, so assembling the app needs
+# no toolchain beyond the compiler — but a missing file must stop the build rather than ship a
+# bundle that silently falls back to the generic application icon.
+ICON="$(dirname "$0")/Resources/AppIcon.icns"
+if [[ ! -f "$ICON" ]]; then
+    echo "!!! $ICON is missing. Run ./make-icon.sh to render it." >&2
+    exit 1
+fi
+cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
 # Verified, not assumed — the recurring lesson here. A release build that quietly produced one
 # slice would ship an installer promising Intel support it cannot honour.
@@ -75,6 +90,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>PlugInput</string>
     <key>CFBundleDisplayName</key><string>PlugInput</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <!--
+      CFBundleIconFile is the key Finder, the installer and the About panel read. The name is
+      the file's, without its extension. LSUIElement means the app has no dock tile, so the
+      icon is not cosmetic in the usual place it would be: it is what the user sees in the
+      .pkg, in Applications, and in the Privacy & Security microphone list.
+    -->
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleIconName</key><string>AppIcon</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$BUILD</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>

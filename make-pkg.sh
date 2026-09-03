@@ -119,6 +119,15 @@ if [[ ! -x "$OUT/root-app/Applications/PlugInput.app/Contents/Resources/uninstal
     exit 1
 fi
 
+# Same rule, same reason. An app with no icon installs and runs perfectly, so nothing downstream
+# of here would ever report it — the user just finds a generic application icon in the installer
+# and in Applications.
+if [[ ! -f "$OUT/root-app/Applications/PlugInput.app/Contents/Resources/AppIcon.icns" ]]; then
+    echo "!!! the staged app has no Contents/Resources/AppIcon.icns." >&2
+    echo "    Run ./make-icon.sh, then rebuild with ./make-app.sh release. Refusing." >&2
+    exit 1
+fi
+
 # --- postinstall ----------------------------------------------------------------------------
 
 # Restarting coreaudiod is how a HAL plug-in gets picked up; there is no lighter-weight signal
