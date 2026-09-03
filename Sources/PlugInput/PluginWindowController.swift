@@ -25,6 +25,13 @@ final class PluginWindowController {
     /// re-shows the *previous* plugin's interface, still wired to a unit the engine has detached.
     private var presentedUnits: [UUID: AVAudioUnit] = [:]
 
+    /// The interface request currently outstanding for each slot, and the counter that numbers
+    /// them. `requestViewController` is asynchronous, so a slot can have a request in flight
+    /// with no window to show for it yet — a state neither `windows` nor `presentedUnits` can
+    /// represent, and the one every stale-callback bug here lives in.
+    private var pendingRequests: [UUID: Int] = [:]
+    private var requestCounter = 0
+
     func show(_ effect: AVAudioUnit, id: UUID, title: String) {
         // Reuse the open window rather than stacking duplicates on repeated clicks — but only
         // when it is already showing this same plugin.
@@ -37,10 +44,33 @@ final class PluginWindowController {
         close(id)
         presentedUnits[id] = effect
 
+        requestCounter += 1
+        let request = requestCounter
+        pendingRequests[id] = request
+
+        // The unit rides along inside the completion so it cannot be deallocated while the
+        // vendor is still building a view against it. Removing a slot drops the model's
+        // reference immediately, and the engine drops its own as soon as the restart detaches
+        // the node — neither waits for a GUI request nobody told them about.
+        let held = HeldUnit(unit: effect)
+
         effect.auAudioUnit.requestViewController { [weak self] viewController in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.present(viewController, id: id, title: title)
+                withExtendedLifetime(held) {
+                    // A heavy plugin takes hundreds of milliseconds to build its GUI, which is
+                    // ample time to remove the slot behind it or to click the button a second
+                    // time. Both used to open a window anyway: the first for a plugin the user
+                    // had just deleted, wired to a unit the engine had already detached, and
+                    // the second on top of the first — overwriting `windows[id]` and stranding
+                    // a window on screen that nothing could close again.
+                    //
+                    // Numbering the requests is what distinguishes them; unit identity cannot,
+                    // since two requests for the same slot name the same unit.
+                    guard self.pendingRequests[id] == request else { return }
+                    self.pendingRequests[id] = nil
+                    self.present(viewController, id: id, title: title)
+                }
             }
         }
     }
@@ -99,10 +129,25 @@ final class PluginWindowController {
         windows[id]?.close()
         windows[id] = nil
         presentedUnits[id] = nil
+        // Abandons any request still in flight for this slot, which is the whole point: the
+        // window it would have opened belongs to a plugin that is on its way out.
+        pendingRequests[id] = nil
     }
 
     func closeAll() {
-        // Over a snapshot of the keys: `close` mutates `windows` as it goes.
-        for id in Array(windows.keys) { close(id) }
+        // Over the union of both, not just `windows`: a slot with a request in flight has no
+        // window yet, and leaving its request live would let a plugin interface open during or
+        // after teardown.
+        for id in Set(windows.keys).union(pendingRequests.keys) { close(id) }
     }
+}
+
+/// Carries an `AVAudioUnit` into a `@Sendable` completion for one reason: to hold it alive
+/// until the vendor's view-controller request has finished with it.
+///
+/// `@unchecked Sendable` on the same terms as `ReleaseBox` in `AudioCore` — the unit is never
+/// touched through this box, only kept. The completion runs on the main thread, so if this box
+/// does hold the last reference, the vendor's teardown runs there too (gotcha #29).
+private struct HeldUnit: @unchecked Sendable {
+    let unit: AVAudioUnit
 }
