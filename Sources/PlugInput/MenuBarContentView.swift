@@ -91,8 +91,17 @@ struct MenuBarContentView: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(alignment: .firstTextBaseline) {
             Text("PlugInput").font(.headline)
+
+            // Selectable on purpose: this is the number a bug report needs, and the alternative
+            // is asking someone to find an About panel that a menu bar app does not have.
+            Text(AppVersion.current.description)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .textSelection(.enabled)
+                .help("The running version — quote this when reporting a problem")
+
             Spacer()
             Button(model.isRunning ? "Stop" : "Start") { Task { await model.toggle() } }
                 .keyboardShortcut(.defaultAction)

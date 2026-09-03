@@ -253,6 +253,12 @@ final class AppModel {
         guard !hasRestored else { return }
         hasRestored = true
 
+        // First line of every transcript, so a log excerpt says which build produced it. Every
+        // question this app gets asked is answered from its log, and until now none of those
+        // logs said whether the reporter was running the build that fixed the thing they are
+        // reporting.
+        EngineLog.logger.info("PlugInput \(AppVersion.current.description, privacy: .public) starting")
+
         await refresh()
 
         await loadChain(snapshot.chain)
