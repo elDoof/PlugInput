@@ -4,12 +4,13 @@ A macOS menu bar app that puts audio plugins on your live microphone, so you can
 compressor (or anything else) on your voice without opening a DAW — and have Zoom / Discord /
 OBS see the processed signal as a microphone.
 
-## Status: v0.9.0 released 2026-08-19; stability work since then is committed but **unpushed**
+## Status: v0.9.0 released 2026-08-19; everything since is on `main` but **unreleased**
 
-`main` is **3 commits ahead of `origin/main`** and no tag points at it. Everything under
-"Post-v0.9.0 stability work" below is local only — users are still running v0.9.0, which has all
-four of the bugs those commits fix. Deciding whether that ships as v0.9.1 is the first open
-question a new session inherits, not a detail.
+`main` is pushed and current as of 2026-09-03, but **no tag points past v0.9.0 and no installer
+has been built from it**. Everything under "Recent changes" below is therefore visible in the
+repository and in nobody's hands: users are still running v0.9.0, which still has all four of the
+bugs the stability work fixes. Cutting v0.9.1 is the first open question a new session inherits,
+not a detail — and it is now a packaging decision rather than a git one.
 
 Shipped: <https://github.com/elDoof/PlugInput/releases/tag/v0.9.0>. The repository is public,
 the `.pkg` is signed with a Developer ID and notarized, and the published asset was verified as
@@ -71,7 +72,36 @@ README describe *use* while this describes *why*.
 
 ### Recent changes
 
-**Post-v0.9.0 stability work, unpushed** (three commits, gotchas #29–#34). Switching plugins
+**An app icon, a version readout, and one more window-lifetime fix** (2026-09-03). The icon is the
+last of the three things "still missing for a confident v1" that could be done without a
+decision; crash reporting and updates both remain.
+
+- **`Resources/AppIcon.icns` is drawn in code** — `Tools/render-icon.swift`, rendered by
+  `./make-icon.sh`, committed as an artifact so `make-app.sh` needs no toolchain beyond the
+  compiler to assemble a bundle. Five bars, cyan to indigo, on a dark plate: input entering the
+  chain and leaving it changed. Each size is rendered natively rather than downscaled from
+  1024, because at 16pt a bar is under two pixels wide and a scaled one smears. Both scripts
+  now **refuse to build without it** — `make-app.sh` because the icon has to be inside the
+  bundle before `codesign` (gotcha #28), `make-pkg.sh` because an app with no icon installs and
+  runs perfectly and nothing downstream would ever report it.
+- **The running version is now stated in two places** — first line of every log transcript
+  (`PlugInput 0.9.0 (28) starting`) and beside the title in the menu, selectable so it can be
+  pasted into a bug report. This app is diagnosed entirely from its log and `session.json`, and
+  neither said which build produced them. With fixes sitting behind a release, "it still
+  freezes" is not actionable without knowing whether the reporter has the build that fixed it.
+  `AppVersion` reads the bundle rather than a compiled-in constant, so it cannot disagree with
+  what the installer shipped, and it says "unbundled development build" rather than inventing a
+  number when there is no Info.plist.
+- **`requestViewController`'s completion could outlive what it was requested for** (gotcha #35),
+  which is a real defect on the chain UI path nobody has clicked. Found by reading, not by a
+  crash report.
+- **`./make-app.sh debug` never ran**, on any machine, since `set -u` was added: macOS ships
+  bash 3.2, where an empty array expansion is an *unbound variable* rather than an empty list.
+  Release builds fill that array, so the one configuration that leaves it empty was the one
+  nobody exercised. 84 unit tests pass; the app was relaunched from the rebuilt bundle and its
+  first log line read the version above.
+
+**Post-v0.9.0 stability work** (three commits, gotchas #29–#34). Switching plugins
 crashed and froze; none of the crashes turned out to be the third-party plugins' fault, and the
 one that was is now handled anyway.
 
@@ -125,8 +155,9 @@ Two standing non-deliveries, both deliberate:
 ## Build and run
 
 ```bash
-swift build && swift test     # library + 80 unit tests
+swift build && swift test     # library + 84 unit tests
 ./make-driver.sh install      # builds + installs the PlugInput HAL driver (sudo, once)
+./make-icon.sh                # only when the artwork changes — the .icns is committed
 ./make-app.sh release         # assembles PlugInput.app
 open PlugInput.app            # waveform icon appears in the menu bar
 killall PlugInput
@@ -164,14 +195,16 @@ Sources/AudioCore/       no UI imports — the testable half
                MainThreadRelease (gotcha #29)
   Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch, PluginChain
   Persistence/ SessionSnapshot, SessionStore
-  Diagnostics/ EngineLog, EngineLogReader, AudioLevel, MainThreadWatchdog +
+  Diagnostics/ EngineLog, EngineLogReader, AudioLevel, AppVersion, MainThreadWatchdog +
                MainThreadStallDetector (gotcha #34)
 Sources/ObjCExceptionBridge/  the only Objective-C in the project — @try/@catch, see gotcha #21
 Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindowController,
                          LoginItem
   Views/       ConsoleView (window: routing, meter, activity), ChainEditorView (reorder,
                bypass, remove), PluginBrowserView (search, adds to the chain)
-Tests/AudioCoreTests/    80 tests
+Tests/AudioCoreTests/    84 tests
+Tools/render-icon.swift  the app icon, as CoreGraphics drawing code — ./make-icon.sh renders it
+Resources/AppIcon.icns   committed build artifact; make-app.sh and make-pkg.sh both require it
 Spike/                 Phase 0 verification harness — separate package, kept as reference
 ```
 
@@ -614,6 +647,32 @@ silence rather than an error.
     stall to nothing. Verified end to end against the real app with `kill -STOP`: 75 seconds of
     ordinary running including a four-plugin load produced no report, and an induced 5.2s stall
     produced exactly one, plus its recovery.
+35. **An asynchronous vendor callback outlives the thing it was asked for, and `close` cannot
+    reach a window that does not exist yet.** `requestViewController` is asynchronous, and for a
+    heavy plugin it is hundreds of milliseconds of the vendor building its whole interface. For
+    that whole time the slot has a request in flight and *nothing to show for it* — a state
+    neither `windows` nor `presentedUnits` could represent, so `close(id)` had nothing to clear
+    and the completion ran regardless of what had happened in between.
+    Two ways that goes wrong, both on the chain UI path nobody has clicked. Open a plugin's
+    interface and remove the slot before it appears, and the late callback opens a window for a
+    plugin the user has just deleted, wired to a unit the engine has already detached and the
+    model has already released — the exact failure this class is keyed by slot id to avoid,
+    arriving through the one path that outruns `close`. Or click the button twice: the second
+    click does not take the "already open" early return, because there is still no window, so
+    two requests land, `present` overwrites `windows[id]` with the second, and the first window
+    is left on screen with nothing holding it — `close` and `closeAll` can no longer reach it.
+    Fixed by **numbering the requests**: `pendingRequests[id]` holds the current one, `close`
+    clears it, and a completion whose number no longer matches drops its view controller and
+    returns. Unit identity cannot do this job — two requests for the same slot name the same
+    unit, which is precisely the double-click case. `closeAll` now iterates the union of the two
+    dictionaries, or a request in flight could open an interface *during* teardown.
+    The unit is also carried into the completion in an `@unchecked Sendable` box, on the same
+    terms as `ReleaseBox`: a vendor building a view against a unit that the model and the engine
+    have both let go of is a use-after-free in code nothing here can see into. Swift's
+    concurrency checking is what surfaced this — capturing the `AVAudioUnit` directly is a
+    `sending 'effect' risks causing data races` error, not a warning.
+    **Found by reading the code, not from a crash report** — worth saying, because this file is
+    otherwise a list of things that were only understood after they broke something.
 
 ## Persistence
 
@@ -648,12 +707,14 @@ whether the engine actually started. Delete it to reset the app.
 
 ## Next steps
 
-- **Ship the stability work — the first decision, because it is already written.** `main` is
-  three commits ahead of `origin/main` with four real bug fixes on it (gotchas #29–#34) and
-  nothing released. Every user is on v0.9.0 and still has all four. Push, and cut v0.9.1 with
-  `./make-pkg.sh --notarize`; the credentials are in place and unchanged. The one thing worth
-  doing *before* that is the chain-UI pass below, since a release is the natural moment to have
-  clicked the buttons at least once.
+- **Cut v0.9.1 — the first decision, because everything in it is already written and pushed.**
+  `main` carries four real bug fixes (gotchas #29–#34) plus the icon and version readout, and
+  no tag points past v0.9.0. Every user is on v0.9.0 and still has all four bugs. The whole
+  release is `./make-pkg.sh --notarize`; the credentials are in place and unchanged. Bump
+  `./VERSION` first — it still reads 0.9.0, and macOS refuses to upgrade to a package whose
+  version is not greater than the installed one. The one thing worth doing *before* that is the
+  chain-UI pass below, since a release is the natural moment to have clicked the buttons at
+  least once.
 - **Confirm the chain UI by hand — still nobody's clicked it.** It shipped in v0.9.0 unclicked,
   the release notes say so, and a first user reaches it before anyone here does. The engine below
   it is measured; the buttons are not. One pass: add two or three effects, reorder with ↑/↓,
@@ -705,10 +766,14 @@ whether the engine actually started. Delete it to reset the app.
   2s at error level, so the next report should carry its own evidence — ask for
   `main thread unresponsive` lines from the unified log before theorising. Do not guess at a
   cause again without a number; that mistake is recorded in #32 precisely so it is not repeated.
-- **Still missing for a confident v1:** an app icon, crash reporting (with in-process plugin
-  hosting, crash reports are the only way to learn which plugin broke someone's setup), and an
-  update mechanism. Now that v0.9.0 is installed on other machines, retrofitting updates is the
-  painful one — it is the next decision worth making, not a later one.
+- **Still missing for a confident v1:** crash reporting (with in-process plugin hosting, crash
+  reports are the only way to learn which plugin broke someone's setup), and an update
+  mechanism. Now that v0.9.0 is installed on other machines, retrofitting updates is the
+  painful one — it is the next decision worth making, not a later one. The cheap version of it
+  was costed and not built: read the GitHub releases API at launch, compare against
+  `CFBundleShortVersionString`, and offer a link — no Sparkle, no signing keys, no auto-install,
+  and the app is not sandboxed so it needs no new entitlement. **The app icon is done** — drawn
+  in `Tools/render-icon.swift`, see "Recent changes".
 
 Persistence and the login item are built — see "Persistence" above.
 
