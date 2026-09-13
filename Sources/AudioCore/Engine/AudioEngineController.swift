@@ -56,6 +56,30 @@ public final class AudioEngineController: @unchecked Sendable {
     /// a unit left attached to a stopped engine is a leak the next start inherits.
     private var effectNodes: [AVAudioUnit] = []
 
+    /// The capture path, which is no longer the input node's own connection. See gotcha #36.
+    ///
+    /// `AVAudioEngine`'s input node captures audio it will not deliver downstream on this
+    /// platform: a tap on it reports real levels while everything connected below it receives
+    /// exact digital silence. The tap is therefore the capture, this ring carries the frames,
+    /// and `inputSourceNode` renders them into the chain. `inputSinkNode` is connected to the
+    /// input node and holds `outputVolume` at zero — it exists only so that *something* is
+    /// connected to the input node, which is what pulls its graph-side format onto the
+    /// hardware rate (gotcha #27). Silent rather than absent, so that an OS which starts
+    /// delivering input again cannot leak an unprocessed dry path around the chain.
+    private var inputRing: InputRingBuffer?
+    /// The same ring as `inputRing`, guarded by `publishedLock` so the meter can read it.
+    private var publishedRing: InputRingBuffer?
+    private var inputSourceNode: AVAudioSourceNode?
+    private var inputSinkNode: AVAudioMixerNode?
+
+    /// Frames requested per tap callback. A hint — AVFAudio may hand over more.
+    private static let inputTapFrames: AVAudioFrameCount = 512
+
+    /// Ring capacity, in frames. Bounds worst-case added latency at roughly 85 ms at 48kHz
+    /// before the drop-oldest policy starts reclaiming it, with room to absorb the jitter
+    /// between a tap buffer and a device buffer that are not the same size.
+    private static let inputRingCapacityFrames = 4096
+
     /// Whether a tap is currently installed on the input node's bus 0.
     ///
     /// Tracked separately because a tap's lifetime is **not** the engine's: `AVAudioEngine`
@@ -65,8 +89,23 @@ public final class AudioEngineController: @unchecked Sendable {
     /// aborted outright. See the crash note on `installInputTap`.
     private var isTapInstalled = false
 
+    /// Whether a meter tap is installed on the main mixer's bus 0. Tracked separately from the
+    /// input tap for the same reason that one is tracked at all (gotcha #14): a tap outlives
+    /// the engine that was running when it was installed.
+    private var isOutputTapInstalled = false
+
     /// Written by the realtime tap, read by the UI; carries its own lock.
     private let peakLevel = PeakLevel()
+
+    /// Peak of what leaves the chain, measured at the main mixer.
+    ///
+    /// The input meter alone cannot tell the two halves of this app apart. Capture and the
+    /// route out to the virtual device fail the same way — exact digital silence with every
+    /// layer reporting success — so a single meter leaves "no audio in Discord" ambiguous
+    /// between a microphone that is not arriving and a chain output that is not being carried.
+    /// Read together, they name the half: input moving with output at zero is the graph losing
+    /// it; both at zero is capture.
+    private let outputPeakLevel = PeakLevel()
 
     /// Values the UI reads, published out from `queue` under a lock.
     ///
@@ -356,6 +395,7 @@ public final class AudioEngineController: @unchecked Sendable {
         // it only "while running" strands one behind whenever the engine has already stopped
         // itself — and the next start then aborts the process rather than throwing.
         removeInputTap()
+        removeOutputTap()
         if engine.isRunning {
             ignoringObjCException("stopping engine") { engine.stop() }
         }
@@ -363,9 +403,24 @@ public final class AudioEngineController: @unchecked Sendable {
             ignoringObjCException("detaching effect") { engine.detach(node) }
         }
         releaseEffectsOnMain()
+        // The source and sink carry no vendor code, so unlike the effect units (gotcha #29)
+        // they can be released on whatever thread gets here.
+        if let inputSourceNode {
+            ignoringObjCException("detaching input source") { engine.detach(inputSourceNode) }
+        }
+        if let inputSinkNode {
+            ignoringObjCException("detaching input sink") { engine.detach(inputSinkNode) }
+        }
+        inputSourceNode = nil
+        inputSinkNode = nil
+        inputRing = nil
+        publishedLock.lock()
+        publishedRing = nil
+        publishedLock.unlock()
         aggregate?.destroy()
         aggregate = nil
         peakLevel.reset()
+        outputPeakLevel.reset()
         publish(state: .stopped)
         publish(effectLatency: 0)
     }
@@ -401,10 +456,31 @@ public final class AudioEngineController: @unchecked Sendable {
         peakLevel.current
     }
 
+    /// Peak of the signal leaving the chain at the main mixer, 0...1. See `outputPeakLevel`.
+    public var outputPeak: Float {
+        outputPeakLevel.current
+    }
+
     public var state: State {
         publishedLock.lock()
         defer { publishedLock.unlock() }
         return publishedState
+    }
+
+    /// Capture-path health: frames buffered, plus frames lost in each direction. `nil` when
+    /// no engine is running.
+    ///
+    /// Worth exposing because gotcha #36 moved capture off the input node's own downstream
+    /// connection and onto a tap and a ring, and a ring between two audio threads fails in two
+    /// directions that sound identical from outside. `dropped` rising means the tap is
+    /// outrunning the render; `starved` rising means the reverse. Both zero with `available`
+    /// steady is the healthy shape.
+    public var inputRingStatus: (available: Int, counts: InputRingBuffer.Counts)? {
+        publishedLock.lock()
+        let ring = publishedRing
+        publishedLock.unlock()
+        guard let ring else { return nil }
+        return (ring.availableFrames, ring.counts)
     }
 
     /// Latency contributed by the hosted effect, in seconds. Linear-phase EQs and mastering
@@ -491,25 +567,87 @@ public final class AudioEngineController: @unchecked Sendable {
             }
         }
 
-        // The chain, in order: input → effects[0] → … → effects[n-1] → mixer. With no effects
-        // this collapses to the single input → mixer connection, which is exactly what the
-        // one-slot version did.
-        var source: AVAudioNode = inputNode
-        for (index, effect) in effects.enumerated() {
-            try withGraphBarrier("connecting chain position \(index + 1)") {
-                engine.connect(source, to: effect, format: inputFormat)
-            }
-            source = effect
+        // Connect the input node to a silent sink before reading its graph face.
+        //
+        // Nothing downstream consumes this: it is the act of connecting that drags the input
+        // node's graph-side format onto the hardware rate, and reading `outputFormat` before
+        // any connection returns the *system default* device's rate instead — which is gotcha
+        // #27, a silent microphone for a whole release cycle. The volume is zero so that this
+        // path contributes nothing even if a future macOS starts delivering input downstream
+        // again; the chain below is the only route to the mixer.
+        let sink = AVAudioMixerNode()
+        sink.outputVolume = 0
+        try withGraphBarrier("attaching input sink") { engine.attach(sink) }
+        inputSinkNode = sink
+        try withGraphBarrier("connecting input to sink") {
+            engine.connect(inputNode, to: sink, format: inputFormat)
         }
-        try withGraphBarrier("connecting chain to mixer") {
-            engine.connect(source, to: mixer, format: inputFormat)
+        try withGraphBarrier("connecting sink to mixer") {
+            engine.connect(sink, to: mixer, format: inputFormat)
         }
 
         // Read back rather than reused: the tap's format has to match what the node actually
         // produces, and `installTap` signals a mismatch by raising. Connecting above is what
         // moved the graph face onto the hardware rate, so this is the proof it moved.
         let tapFormat = inputNode.outputFormat(forBus: 0)
-        try installInputTap(on: inputNode, format: tapFormat)
+
+        // The real capture path. The tap writes into `ring`; this node renders out of it.
+        //
+        // **Mono, deliberately, and it has to be.** The input channel map has already chosen
+        // one of the device's channels (gotcha #26) and delivers it as channel 0, so a wider
+        // chain would carry the interface's other inputs as passengers — on a 14-input Apollo,
+        // thirteen of them. It is also the difference between working and silent: an
+        // `AVAudioMixerNode` fed 14 channels with no channel layout to downmix by emits
+        // silence, which is exactly what the first version of this fix measured, while mono
+        // into the stereo mixer measured -14.0 dBFS on the same graph.
+        let chainFormat = AVAudioFormat(standardFormatWithSampleRate: tapFormat.sampleRate, channels: 1)
+        guard let chainFormat else {
+            throw AudioCoreError.message(
+                "could not build a mono chain format at \(tapFormat.sampleRate)Hz"
+            )
+        }
+        let ring = InputRingBuffer(channelCount: 1, capacityFrames: Self.inputRingCapacityFrames)
+        inputRing = ring
+        publishedLock.lock()
+        publishedRing = ring
+        publishedLock.unlock()
+        // `PLUGINPUT_TEST_TONE=1` feeds the chain a 440Hz tone instead of the microphone.
+        //
+        // This app has two independently silent halves — capture into the ring, and the route
+        // from the chain out through the aggregate's output channel map to the virtual device —
+        // and both fail by producing exact digital silence rather than an error. Swapping the
+        // chain's head for a signal of known amplitude is what tells the two apart without
+        // rebuilding: a tone that reaches `Spike`'s listener proves the whole output leg,
+        // leaving capture as the only place the microphone can be going missing.
+        let isTestTone = ProcessInfo.processInfo.environment["PLUGINPUT_TEST_TONE"] == "1"
+        if isTestTone {
+            EngineLog.logger.info("PLUGINPUT_TEST_TONE set — feeding the chain a 440Hz tone")
+        }
+        let sourceNode = AVAudioSourceNode(
+            format: chainFormat,
+            renderBlock: isTestTone
+                ? Self.toneRender(sampleRate: chainFormat.sampleRate)
+                : Self.inputRender(reading: ring)
+        )
+        try withGraphBarrier("attaching input source") { engine.attach(sourceNode) }
+        inputSourceNode = sourceNode
+
+        // The chain, in order: source → effects[0] → … → effects[n-1] → mixer. With no effects
+        // this collapses to the single source → mixer connection, which is exactly what the
+        // one-slot version did.
+        var source: AVAudioNode = sourceNode
+        for (index, effect) in effects.enumerated() {
+            try withGraphBarrier("connecting chain position \(index + 1)") {
+                engine.connect(source, to: effect, format: chainFormat)
+            }
+            source = effect
+        }
+        try withGraphBarrier("connecting chain to mixer") {
+            engine.connect(source, to: mixer, format: chainFormat)
+        }
+
+        try installInputTap(on: inputNode, format: tapFormat, into: ring)
+        try installOutputTap(on: mixer)
 
         // Every face of every node, plus what the hardware actually says, logged once the graph
         // is fully wired. A graph running at a different rate than the device is silent, not
@@ -582,17 +720,47 @@ public final class AudioEngineController: @unchecked Sendable {
     /// third line of defence behind both. Order matters: keep clearing the bus first. The
     /// barrier turns this crash into a message, which is strictly better than dying, but a
     /// start that fails is still a start that fails — it is not a licence to stop preventing it.
-    private func installInputTap(on node: AVAudioNode, format: AVAudioFormat) throws {
+    private func installInputTap(
+        on node: AVAudioNode,
+        format: AVAudioFormat,
+        into ring: InputRingBuffer
+    ) throws {
         removeInputTap()
         try withGraphBarrier("installing input tap") {
             node.installTap(
                 onBus: 0,
-                bufferSize: 1024,
+                bufferSize: Self.inputTapFrames,
                 format: format,
-                block: Self.peakTap(writingTo: peakLevel)
+                block: Self.captureTap(writingTo: peakLevel, into: ring)
             )
         }
         isTapInstalled = true
+    }
+
+    /// Meters the main mixer. Installed last, so the mixer has already settled on its final
+    /// output format; the tap's format has to match what the node produces or `installTap`
+    /// raises.
+    private func installOutputTap(on node: AVAudioNode) throws {
+        removeOutputTap()
+        let format = node.outputFormat(forBus: 0)
+        try withGraphBarrier("installing output tap") {
+            node.installTap(
+                onBus: 0,
+                bufferSize: Self.inputTapFrames,
+                format: format,
+                block: Self.peakTap(writingTo: outputPeakLevel)
+            )
+        }
+        isOutputTapInstalled = true
+    }
+
+    /// Idempotent, and cleared even if removal raised — on the same terms as `removeInputTap`.
+    private func removeOutputTap() {
+        guard isOutputTapInstalled else { return }
+        ignoringObjCException("removing output tap") {
+            engine.mainMixerNode.removeTap(onBus: 0)
+        }
+        isOutputTapInstalled = false
     }
 
     /// Idempotent. Touches `engine.inputNode` only when a tap is known to be installed —
@@ -627,6 +795,105 @@ public final class AudioEngineController: @unchecked Sendable {
                 peak = max(peak, abs(channel[frame]))
             }
             peakLevel.record(peak)
+        }
+    }
+
+    /// The tap block that *is* the capture path: meter plus ring, on the audio thread.
+    ///
+    /// Built `nonisolated static` for the same reason as `peakTap` — a closure written inline
+    /// in a method inherits that method's actor isolation, and AVFAudio calls this from
+    /// `RealtimeMessenger.mServiceQueue`, where Swift's executor check kills the process on the
+    /// first audio buffer. Nothing here allocates or locks beyond the ring's own unfair lock.
+    nonisolated static func captureTap(
+        writingTo peakLevel: PeakLevel,
+        into ring: InputRingBuffer
+    ) -> AVAudioNodeTapBlock {
+        { @Sendable buffer, _ in
+            guard let channels = buffer.floatChannelData else { return }
+            let frames = Int(buffer.frameLength)
+
+            var peak: Float = 0
+            for frame in 0..<frames {
+                peak = max(peak, abs(channels[0][frame]))
+            }
+            peakLevel.record(peak)
+
+            ring.write(from: channels, frames: frames)
+        }
+    }
+
+    /// Reads the output unit's channel map back. `nil` when the unit will not report one.
+    nonisolated static func readOutputChannelMap(_ unit: AudioUnit, count: Int) -> [Int32]? {
+        var size = UInt32(MemoryLayout<Int32>.size * count)
+        var readBack = [Int32](repeating: -2, count: count)
+        let status = AudioUnitGetProperty(
+            unit,
+            kAudioOutputUnitProperty_ChannelMap,
+            kAudioUnitScope_Output,
+            0,
+            &readBack,
+            &size
+        )
+        guard status == noErr else { return nil }
+        return readBack
+    }
+
+    /// A 440Hz tone at 0.2 amplitude, for `PLUGINPUT_TEST_TONE`. Matches `Spike`'s probe, so
+    /// the harness's own 440Hz detector reports on it and not just the broadband number.
+    ///
+    /// Expect **-17.0 dBFS**, not -14.0: 0.2 amplitude is -13.98 dBFS and `mainMixerNode`
+    /// equal-power pans this mono source to stereo, costing 3.01 dB. That discrepancy is
+    /// written down in the Phase 0 notes because chasing it once cost a session.
+    nonisolated static func toneRender(sampleRate: Double) -> AVAudioSourceNodeRenderBlock {
+        final class Phase: @unchecked Sendable { var value: Double = 0 }
+        let phase = Phase()
+        let increment = 2.0 * Double.pi * 440.0 / sampleRate
+        return { @Sendable _, _, frameCount, audioBufferList in
+            let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            for frame in 0..<Int(frameCount) {
+                let sample = Float(sin(phase.value) * 0.2)
+                phase.value += increment
+                if phase.value > 2 * .pi { phase.value -= 2 * .pi }
+                for buffer in buffers {
+                    guard let data = buffer.mData else { continue }
+                    data.assumingMemoryBound(to: Float.self)[frame] = sample
+                }
+            }
+            return noErr
+        }
+    }
+
+    /// The render block feeding the chain, pulling whatever the tap has captured.
+    ///
+    /// `withUnsafeTemporaryAllocation` keeps the channel-pointer scratch on the stack: this
+    /// runs on the render thread, where a heap allocation is a dropout waiting for a busy
+    /// moment. A read that comes up short zero-fills and reports silence rather than repeating
+    /// stale audio.
+    nonisolated static func inputRender(reading ring: InputRingBuffer) -> AVAudioSourceNodeRenderBlock {
+        { @Sendable isSilence, _, frameCount, audioBufferList in
+            let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            let frames = Int(frameCount)
+            let channels = min(buffers.count, ring.channelCount)
+            guard channels > 0 else {
+                isSilence.pointee = true
+                return noErr
+            }
+
+            var filled = 0
+            withUnsafeTemporaryAllocation(
+                of: UnsafeMutablePointer<Float>.self,
+                capacity: channels
+            ) { scratch in
+                for channel in 0..<channels {
+                    guard let data = buffers[channel].mData else { return }
+                    scratch[channel] = data.assumingMemoryBound(to: Float.self)
+                }
+                guard let base = scratch.baseAddress else { return }
+                filled = ring.read(into: base, frames: frames)
+            }
+
+            if filled == 0 { isSilence.pointee = true }
+            return noErr
         }
     }
 
@@ -791,6 +1058,34 @@ public final class AudioEngineController: @unchecked Sendable {
                 UInt32(MemoryLayout<Int32>.size * total)
             ),
             "output channel map"
+        )
+
+        // Read the map back, and set it again if it did not stick.
+        //
+        // Gotcha #5: a `noErr` write is not proof. `AVAudioEngine` reconfigures the output
+        // unit's stream formats around `prepare` and `start`, and that reconfiguration
+        // discards a channel map — so the write above can succeed and leave the unit on the
+        // identity map, every frame going to the aggregate's first output pair and nothing to
+        // a virtual device sitting further along. The failure is silent in both directions:
+        // the engine reports running, and the monitor still works precisely because it *is*
+        // the first pair, so only a separate process reading the virtual device sees the zeros.
+        var settled = Self.readOutputChannelMap(unit, count: total)
+        if settled != map {
+            try checkStatus(
+                AudioUnitSetProperty(
+                    unit,
+                    kAudioOutputUnitProperty_ChannelMap,
+                    kAudioUnitScope_Output,
+                    0,
+                    &map,
+                    UInt32(MemoryLayout<Int32>.size * total)
+                ),
+                "output channel map (retry)"
+            )
+            settled = Self.readOutputChannelMap(unit, count: total)
+        }
+        EngineLog.logger.info(
+            "output channel map readback \(settled?.description ?? "unreadable", privacy: .public)"
         )
 
         let virtualOffset = layout.outputOffsets[virtualUID] ?? -1

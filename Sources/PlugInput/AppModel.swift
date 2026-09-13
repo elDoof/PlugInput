@@ -874,7 +874,23 @@ final class AppModel {
                 // input reads as an exact 0.0 here, which is the difference between "macOS is
                 // feeding us zeros" and "the signal is being lost further down the graph".
                 if self.meterTicks % Int(self.meterHz) == 0 {
-                    EngineLog.levels.info("input peak \(self.inputPeak, privacy: .public)")
+                    EngineLog.levels.info(
+                        """
+                        input peak \(self.inputPeak, privacy: .public), \
+                        output peak \(self.engine.outputPeak, privacy: .public)
+                        """
+                    )
+                    if let ring = self.engine.inputRingStatus {
+                        EngineLog.levels.info(
+                            """
+                            capture ring \(ring.available, privacy: .public) buffered, \
+                            \(ring.counts.written, privacy: .public) written, \
+                            \(ring.counts.read, privacy: .public) read, \
+                            \(ring.counts.dropped, privacy: .public) dropped, \
+                            \(ring.counts.starved, privacy: .public) starved
+                            """
+                        )
+                    }
                 }
             }
         }
