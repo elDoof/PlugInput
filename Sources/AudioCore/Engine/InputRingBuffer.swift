@@ -30,6 +30,10 @@ import os
 public final class InputRingBuffer: @unchecked Sendable {
     /// How many frames of audio were discarded because the producer outran the consumer.
     public struct Counts: Equatable, Sendable {
+        /// Number of `write` calls, i.e. tap callbacks. With `written`, this gives both the
+        /// callback rate and the average frames per callback — which is what separates "the
+        /// tap is called too rarely" from "the tap is handed short buffers".
+        public let writes: Int
         public let written: Int
         public let read: Int
         public let dropped: Int
@@ -44,6 +48,7 @@ public final class InputRingBuffer: @unchecked Sendable {
     private var writeCursor = 0
     private var readCursor = 0
     private var fillFrames = 0
+    private var writeCalls = 0
     private var writtenFrames = 0
     private var readFrames = 0
     private var droppedFrames = 0
@@ -75,6 +80,7 @@ public final class InputRingBuffer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return Counts(
+            writes: writeCalls,
             written: writtenFrames,
             read: readFrames,
             dropped: droppedFrames,
@@ -87,6 +93,7 @@ public final class InputRingBuffer: @unchecked Sendable {
         writeCursor = 0
         readCursor = 0
         fillFrames = 0
+        writeCalls = 0
         writtenFrames = 0
         readFrames = 0
         droppedFrames = 0
@@ -125,6 +132,7 @@ public final class InputRingBuffer: @unchecked Sendable {
         writeCursor = (writeCursor + keep) % capacityFrames
         fillFrames += keep
         writtenFrames += keep
+        writeCalls += 1
         if fillFrames > capacityFrames {
             let overrun = fillFrames - capacityFrames
             readCursor = (readCursor + overrun) % capacityFrames

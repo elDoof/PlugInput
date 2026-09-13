@@ -884,6 +884,7 @@ final class AppModel {
                         EngineLog.levels.info(
                             """
                             capture ring \(ring.available, privacy: .public) buffered, \
+                            \(ring.counts.writes, privacy: .public) writes, \
                             \(ring.counts.written, privacy: .public) written, \
                             \(ring.counts.read, privacy: .public) read, \
                             \(ring.counts.dropped, privacy: .public) dropped, \

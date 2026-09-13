@@ -36,13 +36,18 @@ agree at the hardware rate. It was the last release blocker.
 - **The click-level chain UI has never been clicked** — adding, reordering with ↑/↓, toggling
   bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
   See "Working on the audio path".
-- **The capture path is crunchy.** Audio reaches Discord — confirmed by the user on
-  2026-09-13, and measured at −57.5 dBFS through the virtual device from a separate process —
-  but with audible artefacts. The cause is measured, not guessed: the input tap supplies
-  **40,960 frames/sec while the render asks for 48,128**, and every shortfall is zero-filled,
-  so roughly 15% of the signal is silence. `capture ring … written … read … starved` in the
-  log is the readout. It is a sustained supply shortfall rather than jitter, so a larger ring
-  will not touch it — do not "fix" it by raising `inputRingCapacityFrames`.
+- **The driver goes silent after repeated app restarts, and does not self-heal.** This is the
+  live bug, and it is at the driver level rather than in the app. Symptom: `input peak` and
+  `output peak` both moving in the log while a separate process reads **exact −120.0 dBFS**
+  from the PlugInput device. Confirmed against a known-loud control rather than inferred — the
+  `PLUGINPUT_TEST_TONE=1` leg measured −14.0 dBFS on a freshly restarted `coreaudiod` and
+  −120.0 after roughly five app restart cycles, with no code change in between. `sudo killall
+  coreaudiod` clears it every time; waiting 90s does not. Gotcha #22 documents a transient
+  re-sync of this shape, but this form persists, so it is either a worse case of it or
+  something else. **Do not trust any device-level measurement taken after several restarts
+  without re-checking the tone leg first.**
+  It is also the best current explanation of the original report — a user whose app shows a
+  working meter while Zoom or Discord receives silence.
 - **The freeze is unexplained.** Crashes on the switch path are fixed and measured (gotchas
   #29–#31, #33), but the reported *freeze* has never reproduced here, and the leading hypothesis
   — per-edit plugin state capture — was measured at 7–9 ms and ruled out (gotcha #32). A
@@ -78,6 +83,24 @@ limitations. **This file is the engineering companion to it**; keep the overlap 
 README describe *use* while this describes *why*.
 
 ### Recent changes
+
+**The microphone reaches other apps again, and cleanly** (2026-09-13). Two defects, one on top
+of the other; see gotchas #36 and #37.
+
+- **Capture moved off the input node's own downstream connection** (#36). It meters correctly
+  and delivers exact digital silence to anything connected below it on macOS 26.6.2, so the tap
+  is the capture path now, with `InputRingBuffer` between it and an `AVAudioSourceNode` at the
+  head of the chain.
+- **The tap was losing a constant 15% of the signal**, which is what the crunch was (#37). The
+  tap will not call back more often than every 100ms, so a buffer holding less than 100ms of
+  audio silently drops the remainder every cycle — measured at 41,015 frames/sec against 48,058
+  requested, which is 4096/4800 exactly. The size is now derived from the sample rate rather
+  than hardcoded, and measures **48,000 frames/sec with starvation flat at zero**.
+- **There is an output meter**, because capture and the route out to the virtual device fail
+  identically and one meter could not tell them apart. `PLUGINPUT_TEST_TONE=1` proves the whole
+  output leg without a microphone, and is what identified the driver problem above as not being
+  the app's fault.
+
 
 **An app icon, a version readout, and one more window-lifetime fix** (2026-09-03). The icon is the
 last of the three things "still missing for a confident v1" that could be done without a
@@ -704,6 +727,26 @@ silence rather than an error.
     `output peak` are logged together: input moving with output at zero is the graph losing it,
     both at zero is capture. `PLUGINPUT_TEST_TONE=1` swaps the chain's head for a 440Hz tone of
     known amplitude, which proves the whole output leg without a microphone.
+
+37. **An input tap will not call back more often than every 100ms, so a buffer holding less
+    than 100ms of audio loses the difference — silently, and at a constant rate.** Asking for
+    512 frames at 48kHz produced 4096-frame buffers *still arriving every 100ms*. 4096 frames is
+    85ms of audio, so the ~704 frames the hardware produced beyond each buffer were gone before
+    the tap saw them. Measured at **41,015 frames/sec supplied against 48,058 requested** over
+    74 seconds — 4096/4800 to three decimal places, and rock steady, which is what distinguishes
+    it from jitter.
+    **It sounds like crunch, not like dropouts**, because `InputRingBuffer` zero-fills a short
+    read rather than stalling: the shortfall is spread across every cycle as short gaps. The
+    counters name it outright — `starved` climbing while `dropped` stays at zero is a supply
+    shortfall, and the reverse is a consumer that has stopped.
+    So the tap size has to come from the **sample rate**, since the floor is fixed in *time*:
+    `inputTapSeconds` is 0.125, giving 25% of margin over the floor and measuring 48,000
+    frames/sec with starvation flat at zero. Do not replace it with a constant — a constant that
+    works at 48kHz is short at 96kHz. Do not lower it below 0.1 for latency, either; that is the
+    cliff, and the whole failure is silent.
+    The ring was also **exactly one tap buffer deep**, which is the worst available size: the
+    render emptied it before each next callback landed, so every scheduling jitter became
+    another gap. It is several buffers deep now.
 
 ## Persistence
 

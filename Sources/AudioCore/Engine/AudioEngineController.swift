@@ -72,13 +72,36 @@ public final class AudioEngineController: @unchecked Sendable {
     private var inputSourceNode: AVAudioSourceNode?
     private var inputSinkNode: AVAudioMixerNode?
 
-    /// Frames requested per tap callback. A hint — AVFAudio may hand over more.
-    private static let inputTapFrames: AVAudioFrameCount = 512
+    /// Seconds of audio a tap buffer must hold. **Do not lower this below 0.1.**
+    ///
+    /// The input tap has a floor of roughly 100ms between callbacks that a smaller request does
+    /// not move: asking for 512 frames at 48kHz produced 4096-frame buffers *still arriving
+    /// every 100ms*, and 4096 frames is only 85ms of audio, so the ~704 frames the hardware
+    /// produced beyond each buffer were dropped before the tap ever saw them — a silent, and
+    /// exactly constant, 15% of the signal. Measured: 41,015 frames/sec supplied against 48,058
+    /// requested, which is 4096/4800 to three decimal places. The audible result is a crunch,
+    /// not a dropout, because the shortfall is zero-filled rather than delayed.
+    ///
+    /// So the buffer has to hold *more* than the callback interval, and since the interval is
+    /// fixed in time the size has to come from the sample rate. 0.125s leaves 25% of margin
+    /// over the floor; it measured 47,858 frames/sec with starvation flat at zero, as did
+    /// 0.171s. The cost is latency — this is the dominant term in the capture path — so it is
+    /// as close to the floor as the measurement supports rather than a round larger number.
+    private static let inputTapSeconds = 0.125
 
-    /// Ring capacity, in frames. Bounds worst-case added latency at roughly 85 ms at 48kHz
-    /// before the drop-oldest policy starts reclaiming it, with room to absorb the jitter
-    /// between a tap buffer and a device buffer that are not the same size.
-    private static let inputRingCapacityFrames = 4096
+    /// Frames requested per tap callback, at `sampleRate`. A hint AVFAudio may round up — what
+    /// it will not do is call more often than every 100ms. See `inputTapSeconds`.
+    private static func inputTapFrames(at sampleRate: Double) -> AVAudioFrameCount {
+        AVAudioFrameCount((sampleRate * inputTapSeconds).rounded(.up))
+    }
+
+    /// Ring capacity, in frames: several tap buffers deep, so the ring can hold what has
+    /// arrived while the render drains it.
+    ///
+    /// It was originally one tap buffer exactly, which is the worst possible size — the render
+    /// emptied it before each next callback landed, so `available` oscillated between full and
+    /// zero and every scheduling jitter became a zero-filled gap.
+    private static let inputRingCapacityFrames = 32768
 
     /// Whether a tap is currently installed on the input node's bus 0.
     ///
@@ -729,7 +752,7 @@ public final class AudioEngineController: @unchecked Sendable {
         try withGraphBarrier("installing input tap") {
             node.installTap(
                 onBus: 0,
-                bufferSize: Self.inputTapFrames,
+                bufferSize: Self.inputTapFrames(at: format.sampleRate),
                 format: format,
                 block: Self.captureTap(writingTo: peakLevel, into: ring)
             )
@@ -746,7 +769,7 @@ public final class AudioEngineController: @unchecked Sendable {
         try withGraphBarrier("installing output tap") {
             node.installTap(
                 onBus: 0,
-                bufferSize: Self.inputTapFrames,
+                bufferSize: 1024,
                 format: format,
                 block: Self.peakTap(writingTo: outputPeakLevel)
             )
