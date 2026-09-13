@@ -31,6 +31,14 @@ monitor leg, and the exception barrier catching a real double-tap raise.
 The **graph/hardware sample-rate mismatch is fixed** (gotcha #27) — all six format numbers now
 agree at the hardware rate. It was the last release blocker.
 
+**The capture path was rebuilt on 2026-09-13 and is confirmed working in a real call.** On
+macOS 26.6.2 the input node meters correctly and delivers exact digital silence to anything
+connected below it, so capture now runs through the tap and a ring (gotcha #36); the tap was
+then losing a constant 15% of the signal, which was the crunch (gotcha #37). Confirmed by the
+user through **Discord** — monitor audio clear, the input gate holding solid — and not only by
+instrument, which matters here because the instrument has been wrong before. This is the first
+time this app has been verified doing the thing it exists to do, by the person using it.
+
 **Two things remain open, and they are the honest state of the app:**
 
 - **The click-level chain UI has never been clicked** — adding, reordering with ↑/↓, toggling
@@ -268,6 +276,17 @@ cd Spike && swift build
 ./.build/debug/PlugInputSpike tone 14 &             # route tone through the aggregate
 ./.build/debug/PlugInputSpike listen 6              # expect PASS at -14.0 dBFS
 ```
+
+**`tone` mode ignores a device argument, and will tell you the driver is broken when it is
+not.** `listen 6 PlugInput` honours the name and reads that device; `tone 20 PlugInput` does
+**not** — it emits into an aggregate built around *BlackHole 2ch* regardless, and the FAIL line
+it prints names BlackHole even when you asked for PlugInput. Run the two together and the
+result looks like a clean controlled comparison: BlackHole passes, PlugInput reads −120.0, and
+the obvious conclusion is that the renamed driver carries silence (which gotcha #22 makes
+entirely plausible). It is an artefact — nothing was ever writing to PlugInput. This cost a
+wrong conclusion on 2026-09-13, reported to the user before it was caught.
+The way to drive the *app's* virtual device is the app. `PLUGINPUT_TEST_TONE=1` exists for
+exactly this: a known −14.0 dBFS through the real output leg, with no microphone involved.
 
 **The −14.0 dBFS figure does not hold for `tone` mode, and chasing the discrepancy wastes a
 session.** The tone is mono at 0.2 amplitude (−13.98 dBFS) and `tone` mode feeds it through
