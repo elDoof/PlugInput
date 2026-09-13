@@ -36,6 +36,13 @@ agree at the hardware rate. It was the last release blocker.
 - **The click-level chain UI has never been clicked** — adding, reordering with ↑/↓, toggling
   bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
   See "Working on the audio path".
+- **The capture path is crunchy.** Audio reaches Discord — confirmed by the user on
+  2026-09-13, and measured at −57.5 dBFS through the virtual device from a separate process —
+  but with audible artefacts. The cause is measured, not guessed: the input tap supplies
+  **40,960 frames/sec while the render asks for 48,128**, and every shortfall is zero-filled,
+  so roughly 15% of the signal is silence. `capture ring … written … read … starved` in the
+  log is the readout. It is a sustained supply shortfall rather than jitter, so a larger ring
+  will not touch it — do not "fix" it by raising `inputRingCapacityFrames`.
 - **The freeze is unexplained.** Crashes on the switch path are fixed and measured (gotchas
   #29–#31, #33), but the reported *freeze* has never reproduced here, and the leading hypothesis
   — per-edit plugin state capture — was measured at 7–9 ms and ruled out (gotcha #32). A
@@ -155,7 +162,7 @@ Two standing non-deliveries, both deliberate:
 ## Build and run
 
 ```bash
-swift build && swift test     # library + 84 unit tests
+swift build && swift test     # library + 93 unit tests
 ./make-driver.sh install      # builds + installs the PlugInput HAL driver (sudo, once)
 ./make-icon.sh                # only when the artwork changes — the .icns is committed
 ./make-app.sh release         # assembles PlugInput.app
@@ -192,7 +199,7 @@ Sources/AudioCore/       no UI imports — the testable half
   Devices/     CoreAudioProperties, DeviceEnumerator, AggregateDeviceBuilder, InputSelection,
                DeviceDiscovery, VirtualMicrophone (naming constants — see gotchas #17, #19)
   Engine/      EngineDeviceBinding, AudioEngineController, PeakLevel, ObjCExceptionBarrier,
-               MainThreadRelease (gotcha #29)
+               MainThreadRelease (gotcha #29), InputRingBuffer (gotcha #36)
   Plugins/     PluginCatalog, PluginDescriptor, PluginState, PluginSearch, PluginChain
   Persistence/ SessionSnapshot, SessionStore
   Diagnostics/ EngineLog, EngineLogReader, AudioLevel, AppVersion, MainThreadWatchdog +
@@ -202,7 +209,7 @@ Sources/PlugInput/       AppModel, PlugInputApp, MenuBarContentView, PluginWindo
                          LoginItem
   Views/       ConsoleView (window: routing, meter, activity), ChainEditorView (reorder,
                bypass, remove), PluginBrowserView (search, adds to the chain)
-Tests/AudioCoreTests/    84 tests
+Tests/AudioCoreTests/    93 tests
 Tools/render-icon.swift  the app icon, as CoreGraphics drawing code — ./make-icon.sh renders it
 Resources/AppIcon.icns   committed build artifact; make-app.sh and make-pkg.sh both require it
 Spike/                 Phase 0 verification harness — separate package, kept as reference
@@ -673,6 +680,30 @@ silence rather than an error.
     `sending 'effect' risks causing data races` error, not a warning.
     **Found by reading the code, not from a crash report** — worth saying, because this file is
     otherwise a list of things that were only understood after they broke something.
+36. **`AVAudioEngine`'s input node captures audio it will not deliver downstream, so the tap is
+    the capture path now.** Measured on macOS 26.6.2: a tap on the input node reported a real
+    peak while the aggregate the graph fed read **exact digital silence** from a separate
+    process, and a tone injected into that same mixer at that same moment read −14.0 dBFS. The
+    tap works and the render path works; only `engine.connect(inputNode, to:)` carries nothing.
+    So `installTap` became the capture, `InputRingBuffer` carries the frames, and an
+    `AVAudioSourceNode` is the chain's head. `inputSinkNode` is still connected to the input
+    node at zero volume — not because anything consumes it, but because *connecting* is what
+    drags the input node's graph face onto the hardware rate (gotcha #27), and reading
+    `outputFormat` before any connection returns the system default's rate instead. Silent
+    rather than absent, so an OS that starts delivering input again cannot leak an unprocessed
+    dry path around the chain.
+    **The chain runs mono, and it has to.** The input channel map has already picked one of the
+    device's channels (gotcha #26) and delivers it as channel 0, so a wider chain carries the
+    interface's other inputs as passengers — thirteen of them on a 14-input Apollo. It is also
+    the difference between working and silent: an `AVAudioMixerNode` fed 14 channels with no
+    channel layout to downmix by emits silence, which is what the first version of this fix
+    measured, while mono into the stereo mixer measured −14.0 dBFS on the same graph.
+    **There is now an output meter, and it exists because of this.** Capture and the route out
+    to the virtual device fail identically — exact digital silence with every layer reporting
+    success — so one meter left "no audio in Discord" ambiguous between them. `input peak` and
+    `output peak` are logged together: input moving with output at zero is the graph losing it,
+    both at zero is capture. `PLUGINPUT_TEST_TONE=1` swaps the chain's head for a 440Hz tone of
+    known amplitude, which proves the whole output leg without a microphone.
 
 ## Persistence
 
