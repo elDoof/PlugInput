@@ -45,7 +45,9 @@ time this app has been verified doing the thing it exists to do, by the person u
   bypass, opening several plugin windows. The engine below it is verified; the buttons are not.
   See "Working on the audio path".
 - **The driver goes silent after repeated app restarts, and does not self-heal.** This is the
-  live bug, and it is at the driver level rather than in the app. Symptom: `input peak` and
+  live bug, and it is at the driver level rather than in the app. **Partly narrowed on
+  2026-09-14, and the reproduction harness is `Tools/repro-driver-silence.sh`** — read the note
+  at the end of this bullet before trusting any run of it. Symptom: `input peak` and
   `output peak` both moving in the log while a separate process reads **exact −120.0 dBFS**
   from the PlugInput device. Confirmed against a known-loud control rather than inferred — the
   `PLUGINPUT_TEST_TONE=1` leg measured −14.0 dBFS on a freshly restarted `coreaudiod` and
@@ -56,6 +58,24 @@ time this app has been verified doing the thing it exists to do, by the person u
   without re-checking the tone leg first.**
   It is also the best current explanation of the original report — a user whose app shows a
   working meter while Zoom or Discord receives silence.
+  **What 2026-09-14 established.** `gDevice_IOIsRunning`, the `StartIO`/`StopIO` refcount at
+  `BlackHole.c:4329`/`4370`, does **not** leak: `kAudioDevicePropertyDeviceIsRunning` read 0
+  after 32 hours of `coreaudiod` uptime, many app restart cycles, and six more driven back to
+  back. That was the leading structural suspect and it is largely ruled out. What remains are
+  the **function-local statics at `BlackHole.c:4545`** — `lastOutputSampleTime` and
+  `isBufferClear` — which live for the lifetime of `coreaudiod`, are never reset by `StartIO`,
+  and feed the zero-fill guard at 4552. The device's own sample clock *does* restart at 0 on a
+  cold start (`gDevice_NumberTimeStamps`, line 4335), so those statics are left describing a
+  timeline that no longer exists. That is a hypothesis, not a finding: nothing has measured it.
+  The app side is healthy across restarts — six cycles all started their engine and all carried
+  the test tone at `output peak ≈ 0.21`.
+  **The harness cannot measure while system output is routed into a loopback device.** The
+  `Spike/` listener refuses to run and exits 1, and the first version of this script recorded
+  that refusal as six clean readings of silence — a complete false reproduction, caught only by
+  reading the harness's raw output. It now pre-checks for exactly that and refuses to start.
+  Two preconditions for a real run: system output on speakers or headphones, and
+  `sudo launchctl kickstart -k system/com.apple.audio.coreaudiod` from a **real terminal** for a
+  clean baseline, since `sudo` cannot prompt without a TTY.
 - **The freeze is unexplained, and the watchdog's four hits were false.** Crashes on the switch
   path are fixed and measured (gotchas #29–#31, #33), but the reported *freeze* has never
   reproduced here. The leading hypothesis — per-edit plugin state capture — was measured at
