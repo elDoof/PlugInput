@@ -73,6 +73,10 @@ final class AppModel {
 
     private(set) var isMonitorEnabled = true
     private(set) var status = ""
+
+    /// A newer release, once the check has found one. `nil` until then and for ever after if the
+    /// check fails, which is the intended direction of failure — see `UpdateCheck`.
+    private(set) var availableUpdate: UpdateCheck.Available?
     private(set) var inputPeak: Float = 0
     private(set) var opensAtLogin = LoginItem.isEnabled
 
@@ -199,6 +203,26 @@ final class AppModel {
         watchdog.start()
 
         scheduleRestore()
+        checkForUpdate()
+    }
+
+    /// Asks GitHub whether there is a newer release, and records it for the menu to show.
+    ///
+    /// Detached and unawaited: nothing in the app waits on this, a launch must not, and the whole
+    /// feature is advisory. Every failure path inside `UpdateCheck` resolves to "no update", so
+    /// there is nothing to report here and nothing to retry — the next launch asks again.
+    private func checkForUpdate() {
+        let running = AppVersion.current.shortVersion
+        // An unbundled development build has no version to compare, so there is no question to
+        // ask and no request worth making.
+        guard let running else { return }
+
+        Task { [weak self] in
+            guard let body = await UpdateCheck.fetchLatest() else { return }
+            guard let found = UpdateCheck.decide(responseBody: body, currentVersion: running) else { return }
+            await MainActor.run { self?.availableUpdate = found }
+            EngineLog.logger.notice("update available: \(found.version, privacy: .public)")
+        }
     }
 
     /// The engine stopped on its own — an interface unplugged, a device reconfigured.

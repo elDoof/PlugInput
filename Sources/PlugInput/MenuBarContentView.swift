@@ -102,6 +102,15 @@ struct MenuBarContentView: View {
                 .textSelection(.enabled)
                 .help("The running version — quote this when reporting a problem")
 
+            // Only ever present when a newer release actually exists, so it carries information
+            // by being there at all. Opens the release page rather than downloading anything:
+            // this app never replaces its own binary.
+            if let update = model.availableUpdate {
+                Link("Update to \(update.version)", destination: update.url)
+                    .font(.caption2.weight(.semibold))
+                    .help("Opens the release notes for \(update.version) in your browser")
+            }
+
             Spacer()
             Button(model.isRunning ? "Stop" : "Start") { Task { await model.toggle() } }
                 .keyboardShortcut(.defaultAction)
