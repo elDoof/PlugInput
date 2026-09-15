@@ -56,11 +56,14 @@ time this app has been verified doing the thing it exists to do, by the person u
   without re-checking the tone leg first.**
   It is also the best current explanation of the original report — a user whose app shows a
   working meter while Zoom or Discord receives silence.
-- **The freeze is unexplained.** Crashes on the switch path are fixed and measured (gotchas
-  #29–#31, #33), but the reported *freeze* has never reproduced here, and the leading hypothesis
-  — per-edit plugin state capture — was measured at 7–9 ms and ruled out (gotcha #32). A
-  `MainThreadWatchdog` now logs any main-thread stall over 2s at error level (gotcha #34), so
-  the next occurrence names itself. The first thing to do with a fresh freeze report is:
+- **The freeze is unexplained, and the watchdog's four hits were false.** Crashes on the switch
+  path are fixed and measured (gotchas #29–#31, #33), but the reported *freeze* has never
+  reproduced here. The leading hypothesis — per-edit plugin state capture — was measured at
+  7–9 ms and ruled out (gotcha #32). The `MainThreadWatchdog` then fired four times on
+  2026-09-14, up to 17 minutes, which looked like the first hard evidence in the project's
+  history; **it was the watchdog measuring system sleep as a freeze**, and the fix plus the
+  telltale signature are in gotcha #34. The watchdog is now suspension-aware, so the next hit
+  means something. The first thing to do with a fresh freeze report is:
 
   ```bash
   /usr/bin/log show --last 30m --info --predicate 'subsystem == "com.pluginput.app"' \
@@ -696,6 +699,28 @@ silence rather than an error.
     stall to nothing. Verified end to end against the real app with `kill -STOP`: 75 seconds of
     ordinary running including a four-plugin load produced no report, and an induced 5.2s stall
     produced exactly one, plus its recovery.
+
+    **CORRECTED 2026-09-14: the watchdog reported four freezes that never happened, and the
+    verification above is why it shipped.** `kill -STOP` does not block the main thread — it
+    suspends the *whole process*. The watchdog measured with a `ContinuousClock`, which keeps
+    counting while the machine sleeps, so the first poll after any gap measured the entire gap
+    and blamed the main thread for it. The end-to-end check therefore exercised precisely the
+    false-positive path and called it a pass.
+    The field readings: four stalls of 285.4s, 529.5s, 917.2s and 1014.2s on 2026-09-14, the
+    longest 17 minutes. **The tell is in the transcript, and it is unmissable once seen — each
+    stall is followed by its own recovery 0.46–0.56s later**, one poll interval. A genuine
+    1014s block puts 1014s between those two lines; the main thread here answered the first
+    ping it was actually asked. The app was fine every time; the Mac had been asleep.
+    Fixed on both sides. The clock is now a `SuspendingClock`, which stops with the machine. And
+    because a clock cannot see the machine *awake* with this process descheduled (App Nap), each
+    poll now also reports **how late it is itself**: `MainThreadStallDetector` takes
+    `sincePreviousPoll`, and a poll that missed its slot by more than 4× the interval yields
+    `.suspended` — logged at notice level, since nothing is wrong — instead of a stall. Only a
+    poller that kept its 0.5s cadence while the main thread went quiet reports a freeze. Ten
+    tests, including the control that a real 1014.2s block *is* still reported.
+    **So the freeze remains unreproduced**, and those four events are not evidence of it. Do not
+    use `kill -STOP` to test this again: it now correctly reads as suspension. Induce a real
+    stall by blocking the main queue itself.
 35. **An asynchronous vendor callback outlives the thing it was asked for, and `close` cannot
     reach a window that does not exist yet.** `requestViewController` is asynchronous, and for a
     heavy plugin it is hundreds of milliseconds of the vendor building its whole interface. For

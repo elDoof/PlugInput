@@ -28,18 +28,29 @@ public final class MainThreadWatchdog: @unchecked Sendable {
     private static let pollIntervalSeconds: Double = 0.5
 
     private let queue = DispatchQueue(label: "com.pluginput.watchdog", qos: .utility)
-    private let clock = ContinuousClock()
+
+    /// `SuspendingClock`, deliberately, **not** `ContinuousClock`: a continuous clock keeps
+    /// counting while the machine is asleep, so the first poll after a wake measured the whole
+    /// sleep and reported it as a freeze. That is the 2026-09-14 false-positive bug. A suspending
+    /// clock stops with the machine, and the poll-cadence check below covers the case a clock
+    /// cannot see — the machine awake but this process not scheduled.
+    private let clock = SuspendingClock()
 
     /// Everything below is touched from both `queue` and the main queue.
     private let lock = NSLock()
-    private var lastResponse: ContinuousClock.Instant
+    private var lastResponse: SuspendingClock.Instant
+    private var lastPoll: SuspendingClock.Instant
     private var isPingOutstanding = false
     private var detector: MainThreadStallDetector
     private var timer: (any DispatchSourceTimer)?
 
     public init(thresholdSeconds: Double = defaultThresholdSeconds) {
-        detector = MainThreadStallDetector(thresholdSeconds: thresholdSeconds)
+        detector = MainThreadStallDetector(
+            thresholdSeconds: thresholdSeconds,
+            pollIntervalSeconds: Self.pollIntervalSeconds
+        )
         lastResponse = clock.now
+        lastPoll = clock.now
     }
 
     /// Idempotent. Safe to call before the main run loop is up: the first ping simply lands late,
@@ -51,6 +62,7 @@ public final class MainThreadWatchdog: @unchecked Sendable {
         guard timer == nil else { return }
 
         lastResponse = clock.now
+        lastPoll = clock.now
         let source = DispatchSource.makeTimerSource(queue: queue)
         source.schedule(
             deadline: .now() + Self.pollIntervalSeconds,
@@ -75,9 +87,16 @@ public final class MainThreadWatchdog: @unchecked Sendable {
 
     private func poll() {
         lock.lock()
-        let elapsed = Self.seconds(from: lastResponse, to: clock.now)
-        let (next, report) = detector.observing(unresponsiveFor: elapsed)
+        let now = clock.now
+        let elapsed = Self.seconds(from: lastResponse, to: now)
+        let pollGap = Self.seconds(from: lastPoll, to: now)
+        lastPoll = now
+        let (next, report) = detector.observing(unresponsiveFor: elapsed, sincePreviousPoll: pollGap)
         detector = next
+        // After a suspension the outstanding ping is still in flight against a stale baseline, so
+        // measurement restarts from the moment the process came back rather than from before it
+        // went away — otherwise the next poll re-reports the same gap.
+        if case .suspended = report { lastResponse = now }
         let shouldPing = !isPingOutstanding
         if shouldPing { isPingOutstanding = true }
         lock.unlock()
@@ -92,6 +111,12 @@ public final class MainThreadWatchdog: @unchecked Sendable {
         case let .ended(longest):
             EngineLog.logger.error(
                 "main thread responding again after \(longest, format: .fixed(precision: 1), privacy: .public)s"
+            )
+        case let .suspended(gap):
+            // Notice, not error: nothing is wrong. It is logged at all because an unexplained
+            // quarter-hour hole in the transcript is itself confusing to read.
+            EngineLog.logger.notice(
+                "process was not running for \(gap, format: .fixed(precision: 1), privacy: .public)s (sleep or App Nap) — not a stall; main-thread timing restarts here"
             )
         case nil:
             break
@@ -111,7 +136,7 @@ public final class MainThreadWatchdog: @unchecked Sendable {
     }
 
     /// Seconds between two instants, rounded to a tenth — the precision the log line can use.
-    private static func seconds(from start: ContinuousClock.Instant, to end: ContinuousClock.Instant) -> Double {
+    private static func seconds(from start: SuspendingClock.Instant, to end: SuspendingClock.Instant) -> Double {
         let elapsed = end - start
         let raw = Double(elapsed.components.seconds)
             + (Double(elapsed.components.attoseconds) / 1e18)
