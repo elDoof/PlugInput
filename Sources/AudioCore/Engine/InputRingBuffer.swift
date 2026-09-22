@@ -131,7 +131,8 @@ public final class InputRingBuffer: @unchecked Sendable {
 
         writeCursor = (writeCursor + keep) % capacityFrames
         fillFrames += keep
-        writtenFrames += keep
+        droppedFrames += skip
+        writtenFrames += frames
         writeCalls += 1
         if fillFrames > capacityFrames {
             let overrun = fillFrames - capacityFrames

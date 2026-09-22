@@ -197,13 +197,17 @@ struct MenuBarContentView: View {
             }
             .buttonStyle(.bordered)
 
-            if model.effectLatencyMilliseconds > 5 {
-                // Linear-phase EQs and mastering plugins report tens of milliseconds, which
-                // makes live monitoring unusable. Say so rather than let it feel broken.
-                Text(String(format: "Adds %.0f ms latency — too much for live monitoring",
-                            model.effectLatencyMilliseconds))
+            if model.isRunning {
+                Text(String(format: "Capture buffer: %.0f ms · Effects: %.1f ms",
+                            model.captureBufferMilliseconds, model.effectLatencyMilliseconds))
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.secondary)
+                    .help("Capture buffer is the requested size, not measured end-to-end latency. Device buffering adds further delay.")
+                if model.isMonitorEnabled {
+                    Text("Capture buffering adds an audible monitoring delay.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
         }
     }
@@ -212,7 +216,11 @@ struct MenuBarContentView: View {
     /// one `Text`, and a bypassed plugin still sitting in the chain is worth saying out loud.
     private var chainSummary: String {
         model.chain.slots
-            .map { $0.isBypassed ? "(\($0.plugin.name))" : $0.plugin.name }
+            .map { slot in
+                if model.pluginFailures[slot.id] != nil { return "\(slot.plugin.name) (unavailable)" }
+                if model.loadedUnits[slot.id] == nil { return "\(slot.plugin.name) (loading)" }
+                return slot.isBypassed ? "(\(slot.plugin.name))" : slot.plugin.name
+            }
             .joined(separator: " → ")
     }
 

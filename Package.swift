@@ -18,5 +18,6 @@ let package = Package(
         .target(name: "AudioCore", dependencies: ["ObjCExceptionBridge"]),
         .executableTarget(name: "PlugInput", dependencies: ["AudioCore"]),
         .testTarget(name: "AudioCoreTests", dependencies: ["AudioCore"]),
+        .testTarget(name: "PlugInputTests", dependencies: ["PlugInput"]),
     ]
 )

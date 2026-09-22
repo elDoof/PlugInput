@@ -150,6 +150,8 @@ struct InputRingBufferTests {
 
         // Assert
         #expect(destination.values(0, count: 3) == [3, 4, 5])
+        #expect(ring.counts.dropped == 2)
+        #expect(ring.counts.written == 5)
     }
 
     @Test("reports how many frames are available to read")

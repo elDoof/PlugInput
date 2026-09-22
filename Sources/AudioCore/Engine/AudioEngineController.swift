@@ -87,7 +87,7 @@ public final class AudioEngineController: @unchecked Sendable {
     /// over the floor; it measured 47,858 frames/sec with starvation flat at zero, as did
     /// 0.171s. The cost is latency — this is the dominant term in the capture path — so it is
     /// as close to the floor as the measurement supports rather than a round larger number.
-    private static let inputTapSeconds = 0.125
+    public static let inputTapSeconds = 0.125
 
     /// Frames requested per tap callback, at `sampleRate`. A hint AVFAudio may round up — what
     /// it will not do is call more often than every 100ms. See `inputTapSeconds`.

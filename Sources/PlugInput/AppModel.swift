@@ -6,10 +6,6 @@ import SwiftUI
 
 /// All app state, and the only place that talks to `AudioCore`.
 ///
-/// v1 deliberately holds a single effect slot rather than a chain. The routing underneath is
-/// the hard, verified part; growing one slot into an ordered chain is a change to this type
-/// and `AudioEngineController.buildGraph`, not to the device or channel-map logic.
-///
 /// Every user-visible choice — input device, plugin, the plugin's own dial positions, and
 /// whether the engine was running — is mirrored into an immutable `SessionSnapshot` and written
 /// to disk, so a relaunch (or a crash caused by an in-process plugin, gotcha #8) resumes rather
@@ -53,6 +49,9 @@ final class AppModel {
     /// the two together — which is also why slots carry an id rather than being addressed by
     /// index, since a reorder would otherwise repoint every unit at its neighbour.
     private(set) var loadedUnits: [UUID: AVAudioUnit] = [:]
+    private(set) var loadingSlots: Set<UUID> = []
+    private(set) var pluginFailures: [UUID: String] = [:]
+    private let pluginLoader: @MainActor (PluginDescriptor) async throws -> AVAudioUnit
 
     /// The chain's units in signal order, skipping any slot whose plugin failed to load.
     var orderedUnits: [AVAudioUnit] {
@@ -142,6 +141,8 @@ final class AppModel {
     /// and the log says so at error level with the responsible plugin named.
     private static let slowStateCaptureMilliseconds = 100
 
+    /// Tests can disable launch services and inject a suspended loader to exercise edits
+    /// during loading without discovering devices or starting audio.
     /// `store` is injectable for testing; `nil` means "open the default location", which is what
     /// the app does.
     ///
@@ -150,7 +151,14 @@ final class AppModel {
     /// nil store turns every later save into a silent no-op, so a user whose Application Support
     /// directory cannot be written lost every setting on every launch, forever, with nothing
     /// said about why.
-    init(store: SessionStore? = nil) {
+    init(
+        store: SessionStore? = nil,
+        startServices: Bool = true,
+        pluginLoader: @escaping @MainActor (PluginDescriptor) async throws -> AVAudioUnit = {
+            try await PluginCatalog.instantiate($0)
+        }
+    ) {
+        self.pluginLoader = pluginLoader
         var openFailure: String?
         if let store {
             self.store = store
@@ -181,6 +189,8 @@ final class AppModel {
         // Shown immediately, before the units behind it exist — `restore()` instantiates those
         // asynchronously, and a chain that appeared one plugin at a time would read as data loss.
         chain = snapshot.chain
+
+        guard startServices else { return }
 
         // ⌘Q, logout, and the Quit button all end up here. The aggregate device must be
         // destroyed on *every* exit path or it outlives the process (gotcha #7).
@@ -438,22 +448,21 @@ final class AppModel {
 
     // MARK: - Chain
 
-    /// Appends an effect to the end of the chain.
-    ///
-    /// The unit is instantiated *before* the new chain is adopted, so a plugin that fails to load
-    /// leaves both the chain and the engine exactly as they were rather than adding an empty slot
-    /// the graph would silently skip.
+    /// Reserve the slot before suspending, preserving click order and the chain limit.
+    /// Completion only fills that slot; it never reapplies a snapshot of the whole chain.
     func addPlugin(_ descriptor: PluginDescriptor) async {
         let grown = chain.adding(descriptor)
         guard grown != chain, let slot = grown.slots.last else {
             status = "Chain is full — \(PluginChain.maximumSlots) effects is the limit."
             return
         }
-
-        EngineLog.logger.info("chain: added \(descriptor.name, privacy: .public)")
-        guard await instantiate(slot) else { return }
         apply(grown)
-        await restartIfRunning()
+        if await instantiate(slot) { await restartIfRunning() }
+    }
+
+    func retryPlugin(_ id: UUID) async {
+        guard let slot = chain.slot(id), loadedUnits[id] == nil else { return }
+        if await instantiate(slot) { await restartIfRunning() }
     }
 
     func removeSlot(_ id: UUID) async {
@@ -464,6 +473,7 @@ final class AppModel {
         // crash waiting for the next redraw.
         pluginWindows.close(id)
         loadedUnits[id] = nil
+        pluginFailures[id] = nil
         apply(chain.removing(id))
         if chain.isEmpty { stopAutosave() }
         await restartIfRunning()
@@ -499,25 +509,13 @@ final class AppModel {
         update { $0.settingChain(newChain) }
     }
 
-    /// Brings a saved chain back to life, in order.
-    ///
-    /// Slots whose plugin no longer instantiates — uninstalled since last launch, or a vendor
-    /// update that broke it — are dropped from the chain rather than kept as gaps. Keeping them
-    /// would mean a chain that reads as four effects while three are audible, which is exactly
-    /// the kind of silent discrepancy this app is built to avoid.
-    private func loadChain(_ saved: PluginChain) async {
-        var loaded: [PluginSlot] = []
-        for slot in saved.slots where await instantiate(slot) {
-            loaded.append(slot)
+    /// Keep unavailable slots and their presets so a temporary failure is recoverable.
+    /// Never reapply the saved chain after suspension: users may edit it during restore.
+    func loadChain(_ saved: PluginChain) async {
+        for slot in saved.slots {
+            guard chain.slot(slot.id) != nil, loadedUnits[slot.id] == nil else { continue }
+            _ = await instantiate(slot)
         }
-
-        let restored = PluginChain(slots: loaded)
-        if restored != saved {
-            EngineLog.logger.error(
-                "chain: \(saved.slots.count - loaded.count, privacy: .public) saved effect(s) could not be loaded and were dropped"
-            )
-        }
-        apply(restored)
     }
 
     /// Instantiates one slot's plugin and files the unit under that slot's id.
@@ -529,11 +527,16 @@ final class AppModel {
     /// and setting `fullState` is the same unbounded vendor call as reading it.
     @discardableResult
     private func instantiate(_ slot: PluginSlot) async -> Bool {
+        guard chain.slot(slot.id) != nil, !loadingSlots.contains(slot.id) else { return false }
+        loadingSlots.insert(slot.id)
+        pluginFailures[slot.id] = nil
+        defer { loadingSlots.remove(slot.id) }
         let clock = ContinuousClock()
         let startedLoad = clock.now
 
         do {
-            let unit = try await PluginCatalog.instantiate(slot.plugin)
+            let unit = try await pluginLoader(slot.plugin)
+            guard let currentSlot = chain.slot(slot.id) else { return false }
             let loadMilliseconds = Self.milliseconds(since: startedLoad, on: clock)
             var applyMilliseconds = 0
 
@@ -549,7 +552,7 @@ final class AppModel {
                 applyMilliseconds = Self.milliseconds(since: startedApply, on: clock)
             }
 
-            unit.auAudioUnit.shouldBypassEffect = slot.isBypassed
+            unit.auAudioUnit.shouldBypassEffect = currentSlot.isBypassed
 
             EngineLog.logger.info(
                 "loaded \(slot.plugin.name, privacy: .public) in \(loadMilliseconds, privacy: .public)ms, state applied in \(applyMilliseconds, privacy: .public)ms on the main thread"
@@ -559,7 +562,10 @@ final class AppModel {
             startAutosave()
             return true
         } catch {
-            status = "Could not load \(slot.plugin.name): \(error.localizedDescription)"
+            guard chain.slot(slot.id) != nil else { return false }
+            let message = "Could not load \(slot.plugin.name): \(error.localizedDescription)"
+            pluginFailures[slot.id] = message
+            status = message
             return false
         }
     }
@@ -762,6 +768,10 @@ final class AppModel {
         EngineLog.logger.info("quit: teardown complete, exiting before plugin static teardown")
         UserDefaults.standard.synchronize()
         _exit(EXIT_SUCCESS)
+    }
+
+    var captureBufferMilliseconds: Double {
+        AudioEngineController.inputTapSeconds * 1000
     }
 
     var effectLatencyMilliseconds: Double {

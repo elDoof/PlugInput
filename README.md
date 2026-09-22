@@ -56,10 +56,17 @@ To remove everything later:
 4. Press **Start**.
 5. In Zoom, Discord, or OBS, select **PlugInput** as the microphone.
 
+Effects that fail to load stay in the chain with their saved settings. Use **Retry** in the
+chain editor to load them again; unavailable effects do not process audio.
+
 Effects process top to bottom, and the same plugin can appear more than once. Use **Up/Down**
 to reorder, **Bypass** to remove an effect from the signal while keeping its settings, the
 **sliders** to open its interface, and the **trash** to delete it. Bypass is instant; adding,
 removing, and reordering rebuild the audio graph and cause a brief dropout.
+
+The latency display separates the requested **125 ms capture buffer** from reported effect
+latency. This is not a measured end-to-end delay; device buffering adds more. Monitoring
+therefore has an audible delay even without effects.
 
 The **Monitor** checkbox controls whether you hear yourself, and does not affect what other
 apps receive. Turn it off on speakers, or the output feeds back into the microphone — loudly,

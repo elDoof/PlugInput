@@ -69,6 +69,16 @@ struct ChainEditorView: View {
 
             Spacer(minLength: 4)
 
+            if model.loadingSlots.contains(slot.id) {
+                ProgressView().controlSize(.small)
+            } else if let failure = model.pluginFailures[slot.id] {
+                Button("Retry") { Task { await model.retryPlugin(slot.id) } }
+                    .help(failure + " — saved settings are preserved; this effect is not processing audio.")
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .help(failure)
+            }
+
             // No engine restart behind this one — bypass is a live property on the unit, which is
             // what makes it usable for A/B-ing a plugin while actually talking.
             Toggle("Bypass", isOn: bypassBinding(slot))

@@ -52,11 +52,11 @@ struct ConsoleView: View {
 
             Spacer()
 
-            if model.effectLatencyMilliseconds > 0 {
-                Text(String(format: "%.1f ms", model.effectLatencyMilliseconds))
+            if model.isRunning {
+                Text(String(format: "Capture buffer %.0f ms · Effects %.1f ms",
+                            model.captureBufferMilliseconds, model.effectLatencyMilliseconds))
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(model.effectLatencyMilliseconds > 5 ? .orange : .secondary)
-                    .help("Latency added by the plugin. Above ~5 ms is hard to talk over.")
+                    .help("Requested capture buffer and reported effect latency. Total delay also includes device buffering; it has not been measured.")
             }
         }
     }
